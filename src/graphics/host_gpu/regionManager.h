@@ -6,6 +6,9 @@
 #include "graphics/host_gpu/regionDefinitions.h"
 
 #include <atomic>
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+#include <immintrin.h>
+#endif
 #include <mutex>
 #include <utility>
 
@@ -26,13 +29,27 @@
 
 namespace Libs::Graphics {
 
+inline void SpinPause() noexcept {
+#if defined(__x86_64__) || defined(_M_X64) || defined(__i386__) || defined(_M_IX86)
+	_mm_pause();
+#endif
+}
+
 class TrackingSpinLock final {
 public:
 	void lock() noexcept {
 		const auto thread = CurrentThread();
 		while (m_lock.test_and_set(std::memory_order_acquire)) {
 			EXIT_NOT_IMPLEMENTED(m_owner.load(std::memory_order_relaxed) == thread);
-			std::atomic_signal_fence(std::memory_order_seq_cst);
+			// Wait with plain loads and a pause until the lock looks free, then retry the
+			// exchange. Write faults take this lock in the signal handler while another thread
+			// holds it across mprotect and its TLB shootdown; spinning on test_and_set kept the
+			// cache line bouncing between cores and took ~13% of all CPU time in gameplay
+			// (Linux perf, 2026-10-11).
+			do {
+				SpinPause();
+				std::atomic_signal_fence(std::memory_order_seq_cst);
+			} while (m_lock.test(std::memory_order_relaxed));
 		}
 		m_owner.store(thread, std::memory_order_relaxed);
 	}
