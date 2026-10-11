@@ -92,13 +92,12 @@ kyty_emulator.exe --game "<dump>\eboot.bin" --readback-linear-images true --tess
 
 **On Linux** leave out `--redzone`: it is Windows-only, and the Linux emulator rejects it as an
 unknown option. On a 12 GB card the following gets to gameplay (see "Linux, 12 GB card" below).
-`KYTY_HOST_BUFFER_MB` and `KYTY_FAULT_GRANULE_KB` come from two open PRs to this branch
-(host-buffers and fault-granule); without them, drop those two variables and expect the cutscene
-to fill the card. The skip list is Mac's.
+`KYTY_HOST_BUFFER_MB` comes from the open host-buffers PR to this branch; without it, drop that
+variable and expect the cutscene to fill the card. The skip list is Mac's.
 
 ```
 SKIP=bad108e74fb72e9f,4e7f2c6bb9b158a1,8bfd230b9cd875a2,c4df2a00067e0666,dc76e1223a9bf673,e6d76d24f59f8015,12f18ba73d4b5119,198a7ca6e3dfbec7,1d81053379396859,21e4ffa9eaebf903,29be8047c4e86afe,2a69c6facfa03f42,2bd971cbf9fd85b9,2bf24cdfe17d445a,2db5771324658f9b,2ea3957af2daf690,30d445ded2c91412,329858dd50dedcf6,337df7adf22cbcf8,384f47083f0d5e08,3cf86dbfc447bb8c,40978f6a2b51a610,4b32d12a59b34410,76c1cc14d6f7641d,883049efd1de9ca7,919b497919097925,949d0da52574b6bb,9c18c0b9ff0f7997,a0d3108311ea1997,a81255bc7d83eb26,ad3e817088b42ce0,b0164a333a8443f1,ce6af5b8f4b5d395,cf2433f75f08295e,d8cc8c65f6c476d7,d925be771906e8da,deb8684b019495fc,e98e6c7a12cfbb83,f61c05c40f988ea2,f687ff30ac856e49,fbd3835b6b17af6a,fc0537b7278db60c,fceac1321aa192d2
-KYTY_HOST_BUFFER_MB=1024 KYTY_FAULT_GRANULE_KB=64 KYTY_TEXTURE_CACHE_MB=3072 KYTY_BUFFER_CACHE_MB=3072 KYTY_VRAM_TARGET_MB=8192 ./_Build/linux/install/kyty_emulator --game <dump> --readback-linear-images true --tessellation --bindless --skip-shaders $SKIP
+KYTY_HOST_BUFFER_MB=1024 KYTY_TEXTURE_CACHE_MB=3072 KYTY_BUFFER_CACHE_MB=3072 KYTY_VRAM_TARGET_MB=8192 ./_Build/linux/install/kyty_emulator --game <dump> --readback-linear-images true --tessellation --bindless --skip-shaders $SKIP
 ```
 
 No game patch is needed.
@@ -157,9 +156,14 @@ by wall time: a cold cache changes timing by about 2x without changing how far t
   re-uploads stopped.
 - **CPU: write-fault lock contention.** perf in the fight showed ~13% of all CPU in game
   threads spinning on the tracker's region lock in the write-fault handler, behind a holder
-  doing mprotect and a TLB shootdown per 4 KB page. The fault-granule PR (a pause in the spin
-  lock, and `KYTY_FAULT_GRANULE_KB=64`) cut the spin-wait to 2.2% and the shootdowns from ~1.4%
-  to ~0.4%; fps 5-7 to 5-10.
+  doing mprotect and a TLB shootdown per 4 KB page. Invalidating a 64 KB granule per buffer
+  write fault cut the spin-wait to 2.2%, but froze the game within minutes (rendering and AMM
+  streaming stop, audio carries on), so it was dropped; the spin lock pause stayed.
+- **GPU drains.** Collecting the 2.7 GB system-memory buffer downloads it first, a ~100 ms
+  drain. Keeping system-memory buffers out of the buffer GC (host-buffers PR) cut the worst
+  wait to ~33 ms; fps in the fight 5-20, no freeze in 6+ minutes.
+- **Textures.** Ground and tree textures stay low resolution: likely the stale bindless slots
+  under Gaps (streamed mips never re-synced).
 - **Visual.** Explosion smoke draws as solid black blobs (a skipped shader, or one of the
   unsupported ones). Lighting, fire, fog and characters look right.
 - **Profiling on Linux.** Release builds are stripped, but the linker map
