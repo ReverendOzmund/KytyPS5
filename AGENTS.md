@@ -90,11 +90,15 @@ The command-line equivalent:
 kyty_emulator.exe --game "<dump>\eboot.bin" --readback-linear-images true --tessellation --redzone --bindless --printf-direction File --printf-output-file _kyty.txt
 ```
 
-**On Linux** leave out `--redzone`. It is Windows-only, and the Linux emulator rejects it as an unknown
-option. On a 12 GB card, also cap the caches (see "Linux, 12 GB card" below):
+**On Linux** leave out `--redzone`: it is Windows-only, and the Linux emulator rejects it as an
+unknown option. On a 12 GB card the following gets to gameplay (see "Linux, 12 GB card" below).
+`KYTY_HOST_BUFFER_MB` and `KYTY_FAULT_GRANULE_KB` come from two open PRs to this branch
+(host-buffers and fault-granule); without them, drop those two variables and expect the cutscene
+to fill the card. The skip list is Mac's.
 
 ```
-KYTY_TEXTURE_CACHE_MB=3072 KYTY_BUFFER_CACHE_MB=3072 KYTY_VRAM_TARGET_MB=9216 ./_Build/linux/install/kyty_emulator --game <dump> --readback-linear-images true --tessellation --bindless
+SKIP=bad108e74fb72e9f,4e7f2c6bb9b158a1,8bfd230b9cd875a2,c4df2a00067e0666,dc76e1223a9bf673,e6d76d24f59f8015,12f18ba73d4b5119,198a7ca6e3dfbec7,1d81053379396859,21e4ffa9eaebf903,29be8047c4e86afe,2a69c6facfa03f42,2bd971cbf9fd85b9,2bf24cdfe17d445a,2db5771324658f9b,2ea3957af2daf690,30d445ded2c91412,329858dd50dedcf6,337df7adf22cbcf8,384f47083f0d5e08,3cf86dbfc447bb8c,40978f6a2b51a610,4b32d12a59b34410,76c1cc14d6f7641d,883049efd1de9ca7,919b497919097925,949d0da52574b6bb,9c18c0b9ff0f7997,a0d3108311ea1997,a81255bc7d83eb26,ad3e817088b42ce0,b0164a333a8443f1,ce6af5b8f4b5d395,cf2433f75f08295e,d8cc8c65f6c476d7,d925be771906e8da,deb8684b019495fc,e98e6c7a12cfbb83,f61c05c40f988ea2,f687ff30ac856e49,fbd3835b6b17af6a,fc0537b7278db60c,fceac1321aa192d2
+KYTY_HOST_BUFFER_MB=1024 KYTY_FAULT_GRANULE_KB=64 KYTY_TEXTURE_CACHE_MB=3072 KYTY_BUFFER_CACHE_MB=3072 KYTY_VRAM_TARGET_MB=8192 ./_Build/linux/install/kyty_emulator --game <dump> --readback-linear-images true --tessellation --bindless --skip-shaders $SKIP
 ```
 
 No game patch is needed.
@@ -134,25 +138,36 @@ by wall time: a cold cache changes timing by about 2x without changing how far t
 - That last run also flooded its log (see Save data below, now fixed), which may explain the
   slowness. Re-measure it first.
 
-### Linux, 12 GB card (RTX 3080 Ti, build 4802886, 2026-10-11)
+### Linux, 12 GB card (RTX 3080 Ti, Ryzen 5 7600X, base 4802886, 2026-10-11)
 
-- **Memory.** With the default caches the whole PC soft-locks once video memory spills into system
-  RAM. With `KYTY_TEXTURE_CACHE_MB=3072 KYTY_BUFFER_CACHE_MB=3072
-  KYTY_VRAM_TARGET_MB=9216` it stays stable. The device sits at about 9.6 to 9.9 GB during the
-  cutscene, flat, without creeping, and system RAM stays far from full. 2048/2048/8192 behaves the
-  same.
+- **Reaches gameplay.** Intros, INITIAL SETUP, the title screen (~3 fps), the opening cutscene
+  ("30 YEARS AGO", Essex's line, ~5 fps), then the first jungle fight with its tutorials (leap
+  attack, shred, sprint) at 5-10 fps. About 10 minutes played without a crash or freeze.
 - **Screen-reader prompt.** It does not draw on Linux: the screen is blank, but J (Cross) still
   dismisses it. On the 3060 laptop it draws fully.
-- **Title screen.** Reached through intros, INITIAL SETUP and the load menus. "PRESS ⊗ TO START" over
-  the 3D scene runs at about 3 fps.
-- **After Start.** The opening cutscene plays: "30 YEARS AGO", then subtitles ("My name is Nathaniel
-  Essex"), at about 5 fps, frame ~2900.
-- **Hang.** In one run the game stopped advancing later in the cutscene. It logged no error, and
-  closing the window exited cleanly (exit code 0, caches saved). What is stuck is not known yet: the
-  next step is thread stacks taken during the hang.
-- **Logged during the cutscene.** `Shader function expansion hash=...: shader function needs nested calls
-  or unsupported instructions` for `0xe6d76d24f59f8015` (the `V_CMP_EQ_F64` shader under Known
-  problems), `0x29be8047c4e86afe` and `0xfc0537b7278db60c`.
+- **Cutscene hang: fixed by the skip list.** Without it, rendering stops partway through the
+  cutscene (audio and AMPR streaming carry on) right after a very large pipeline starts
+  compiling. With the skip list frames keep coming.
+- **Video memory: one 2.7 GB buffer.** The game describes its whole heap at `0x1210000000` as
+  one 2,801,664 KB buffer. In VRAM it is a quarter of the card, and the collector deletes and
+  re-creates it (each time a 2.7 GB upload), which spikes device use by ~2.8 GB in a second.
+  With the desktop's ~2 GB on top the card fills and the whole PC soft-locks. No cache cap
+  avoids it: the emulator went 2.2 GB past `KYTY_VRAM_TARGET_MB` before collecting.
+  `KYTY_HOST_BUFFER_MB=1024` puts it in system memory, and fps went up (2-5 to 5-7), since the
+  re-uploads stopped.
+- **CPU: write-fault lock contention.** perf in the fight showed ~13% of all CPU in game
+  threads spinning on the tracker's region lock in the write-fault handler, behind a holder
+  doing mprotect and a TLB shootdown per 4 KB page. The fault-granule PR (a pause in the spin
+  lock, and `KYTY_FAULT_GRANULE_KB=64`) cut the spin-wait to 2.2% and the shootdowns from ~1.4%
+  to ~0.4%; fps 5-7 to 5-10.
+- **Visual.** Explosion smoke draws as solid black blobs (a skipped shader, or one of the
+  unsupported ones). Lighting, fire, fog and characters look right.
+- **Profiling on Linux.** Release builds are stripped, but the linker map
+  (`_Build/linux/kyty_emulator_*.map`) resolves perf's addresses. A rootless Distrobox cannot
+  attach perf or gdb to the emulator on the host; a rootful one (`distrobox create --root`)
+  can, after `sysctl kernel.perf_event_paranoid=-1`. Running the emulator inside the
+  container fails instead (`importing the supplied dmabufs failed`) and overwrites the
+  pipeline cache with an empty one.
 
 ## The work for this title, by area
 
