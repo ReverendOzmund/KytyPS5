@@ -58,6 +58,22 @@ cmake --install _Build/windows --prefix _Build/windows/install
 
 `../KytyPS5-bin/` holds a Release install built from exactly this tree.
 
+## Build (Linux)
+
+Tested by Ozmund on Bazzite (Fedora Atomic) with an RTX 3080 Ti (12 GB) on NVIDIA 615.71.09. The tree
+builds unchanged. Bazzite's base system is read-only, so the build runs in a Fedora 44 Distrobox
+container. Create it with `--nvidia`, or the container only sees llvmpipe. The packages are the ones in
+upstream's README, under "Building on Fedora and Fedora Atomic".
+
+```
+git submodule update --init --recursive
+cmake -S . -B _Build/linux -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build _Build/linux --target kyty_emulator launcher
+cmake --install _Build/linux --prefix _Build/linux/install
+```
+
+The installed emulator runs on the host, outside the container.
+
 ## Running the title
 
 In the launcher, add the game folder, edit its configuration and tick:
@@ -72,6 +88,13 @@ The command-line equivalent:
 
 ```
 kyty_emulator.exe --game "<dump>\eboot.bin" --readback-linear-images true --tessellation --redzone --bindless --printf-direction File --printf-output-file _kyty.txt
+```
+
+**On Linux** leave out `--redzone`. It is Windows-only, and the Linux emulator rejects it as an unknown
+option. On a 12 GB card, also cap the caches (see "Linux, 12 GB card" below):
+
+```
+KYTY_TEXTURE_CACHE_MB=3072 KYTY_BUFFER_CACHE_MB=3072 KYTY_VRAM_TARGET_MB=9216 ./_Build/linux/install/kyty_emulator --game <dump> --readback-linear-images true --tessellation --bindless
 ```
 
 No game patch is needed.
@@ -110,6 +133,26 @@ by wall time: a cold cache changes timing by about 2x without changing how far t
   Nobody knows yet whether it reaches gameplay.
 - That last run also flooded its log (see Save data below, now fixed), which may explain the
   slowness. Re-measure it first.
+
+### Linux, 12 GB card (RTX 3080 Ti, build 4802886, 2026-10-11)
+
+- **Memory.** With the default caches the whole PC soft-locks once video memory spills into system
+  RAM. With `KYTY_TEXTURE_CACHE_MB=3072 KYTY_BUFFER_CACHE_MB=3072
+  KYTY_VRAM_TARGET_MB=9216` it stays stable. The device sits at about 9.6 to 9.9 GB during the
+  cutscene, flat, without creeping, and system RAM stays far from full. 2048/2048/8192 behaves the
+  same.
+- **Screen-reader prompt.** It does not draw on Linux: the screen is blank, but J (Cross) still
+  dismisses it. On the 3060 laptop it draws fully.
+- **Title screen.** Reached through intros, INITIAL SETUP and the load menus. "PRESS ⊗ TO START" over
+  the 3D scene runs at about 3 fps.
+- **After Start.** The opening cutscene plays: "30 YEARS AGO", then subtitles ("My name is Nathaniel
+  Essex"), at about 5 fps, frame ~2900.
+- **Hang.** In one run the game stopped advancing later in the cutscene. It logged no error, and
+  closing the window exited cleanly (exit code 0, caches saved). What is stuck is not known yet: the
+  next step is thread stacks taken during the hang.
+- **Logged during the cutscene.** `Shader function expansion hash=...: shader function needs nested calls
+  or unsupported instructions` for `0xe6d76d24f59f8015` (the `V_CMP_EQ_F64` shader under Known
+  problems), `0x29be8047c4e86afe` and `0xfc0537b7278db60c`.
 
 ## The work for this title, by area
 
