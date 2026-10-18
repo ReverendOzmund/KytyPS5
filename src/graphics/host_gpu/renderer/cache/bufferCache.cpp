@@ -1346,7 +1346,7 @@ namespace {
 // to it, a drain of ~100 ms, and the next draw uploads all of it again. They stay unless
 // KYTY_GC_HOST_BUFFERS=1.
 bool KeptOutOfCollection(const Buffer& buffer) {
-	static const uint64_t host_bytes = [] {
+	static const uint64_t host_bytes = []() -> uint64_t {
 		if (std::getenv("KYTY_GC_HOST_BUFFERS") != nullptr) {
 			return uint64_t {0};
 		}
