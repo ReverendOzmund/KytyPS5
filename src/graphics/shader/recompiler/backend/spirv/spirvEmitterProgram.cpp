@@ -273,6 +273,7 @@ void EmitStructuredInstruction(ValueEmitContext& ctx, StructuredFunctionState& s
 		return;
 	}
 	EmitDirectInstruction(ctx, inst);
+	if (TraceShaderEnabled(ctx.state)) EmitTraceMemory(ctx, inst);
 }
 
 void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionState& dispatcher,
@@ -287,6 +288,7 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 		return;
 	}
 	EmitDirectInstruction(ctx, inst);
+	if (TraceShaderEnabled(ctx.state)) EmitTraceMemory(ctx, inst);
 	if (const auto found = dispatcher.spills[ctx.half].find(&inst);
 	    found != dispatcher.spills[ctx.half].end()) {
 		ctx.state.builder.AddFunction(spv::OpStore, found->second,
@@ -395,6 +397,103 @@ void EmitDebugPrintf(EmitterState& state, uint32_t condition, const std::string&
 	                          std::span<const uint32_t>(operands));
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 	EmitLabel(state, merge_label);
+}
+
+// Debug: KYTY_TRACE_SHADERS=<hash>[,<hash>...] prints every buffer load, store and atomic those
+// compute shaders run in single-workgroup dispatches (threads 0-15), through SPIR-V debug printf.
+bool TraceShaderEnabled(const EmitterState& state) {
+	static const std::vector<uint64_t> hashes = [] {
+		std::vector<uint64_t> result;
+		const char*           value = std::getenv("KYTY_TRACE_SHADERS");
+		while (value != nullptr && *value != '\0') {
+			char*      end  = nullptr;
+			const auto hash = std::strtoull(value, &end, 16);
+			if (end == value) break;
+			result.push_back(hash);
+			value = *end == ',' ? end + 1 : end;
+		}
+		return result;
+	}();
+	return state.program.stage == ShaderType::Compute &&
+	       std::ranges::find(hashes, state.program.shader_hash) != hashes.end();
+}
+
+void EmitTraceMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
+	auto&            state = ctx.state;
+	const std::string name {IR::ValueOpcodeName(inst.GetOpcode())};
+	const bool        store = name.starts_with("StoreBuffer") || name.starts_with("StoreAddress");
+	const bool        load  = name.starts_with("LoadBuffer") || name.starts_with("LoadAddress") ||
+	                  name == "ReadConstBuffer";
+	const bool atomic = name.starts_with("BufferAtomic");
+	if (!store && !load && !atomic) return;
+	const auto u = TypeU32(state), b = TypeBool(state);
+	const auto args = inst.NumArgs();
+	auto       cond = args != 0 && inst.Arg(args - 1).GetType() == IR::Type::U1
+	                      ? ctx.Arg(inst, args - 1)
+	                      : ConstantBool(state, true);
+	const auto thread = InputVariableForKind(state, IR::StageInputKind::LocalInvocationIndex) != 0
+	                        ? EmitLocalInvocationIndex(state)
+	                    : state.subgroup_local_invocation_id_variable != 0
+	                        ? EmitSubgroupLocalInvocationId(state)
+	                        : ConstantU32(state, 0);
+	cond = Binary(state, spv::OpLogicalAnd, b, cond,
+	              Binary(state, spv::OpULessThan, b, thread, ConstantU32(state, 16)));
+	for (uint32_t axis = 0; axis < 2; ++axis) {
+		if (InputVariableForKind(state, IR::StageInputKind::WorkgroupId) != 0)
+			cond = Binary(state, spv::OpLogicalAnd, b, cond,
+			    Binary(state, spv::OpIEqual, b,
+			           EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, axis),
+			           ConstantU32(state, 0)));
+		if (InputVariableForKind(state, IR::StageInputKind::NumWorkgroups) != 0)
+			cond = Binary(state, spv::OpLogicalAnd, b, cond,
+			    Binary(state, spv::OpIEqual, b,
+			           EmitInputComponentU32(state, IR::StageInputKind::NumWorkgroups, axis),
+			           ConstantU32(state, 1)));
+	}
+	std::vector<uint32_t> values {ConstantU32(state, inst.Flags<IR::MemoryFlags>().pc), thread,
+	                              ConstantU32(state, ctx.Memory(inst).resource)};
+	for (size_t index = 1; index < 4; ++index)
+		values.push_back(index < args && inst.Arg(index).GetType() == IR::Type::U32
+		                     ? ctx.Arg(inst, index)
+		                     : ConstantU32(state, 0xeeeeeeeeu));
+	const auto add_components = [&](uint32_t id, IR::Type type) {
+		uint32_t count = 0;
+		switch (type) {
+			case IR::Type::U32: values.push_back(id); count = 1; break;
+			case IR::Type::U32x2: count = 2; break;
+			case IR::Type::U32x3: count = 3; break;
+			case IR::Type::U32x4: count = 4; break;
+			default: break;
+		}
+		for (uint32_t i = 0; count > 1 && i < count; ++i) {
+			const auto component = state.builder.AllocateId();
+			state.builder.AddFunction(spv::OpCompositeExtract, u, component, id, i);
+			values.push_back(component);
+		}
+		while (values.size() < 10) values.push_back(ConstantU32(state, 0xeeeeeeeeu));
+	};
+	if (store)
+		add_components(ctx.Arg(inst, args - 2), inst.Arg(args - 2).GetType());
+	else
+		add_components(ctx.Def(IR::Value(const_cast<IR::Inst*>(&inst))), inst.GetType());
+	if (atomic && args > 4) values[7] = ctx.Arg(inst, 4); // v[0] old value, v[1] operand
+	// The guest V# words, when the resource is still the raw descriptor.
+	const auto* handle = args != 0 ? inst.Arg(0).TryInstruction() : nullptr;
+	for (size_t word = 0; word < 4; ++word) {
+		values.push_back(handle != nullptr &&
+		                         handle->GetOpcode() == IR::ValueOpcode::GetBufferResource &&
+		                         word < handle->NumArgs() &&
+		                         handle->Arg(word).GetType() == IR::Type::U32
+		                     ? ctx.Arg(*handle, word)
+		                     : ConstantU32(state, 0xeeeeeeeeu));
+	}
+	char hash[24];
+	std::snprintf(hash, sizeof(hash), "%016llx",
+	              static_cast<unsigned long long>(state.program.shader_hash));
+	EmitDebugPrintf(state, cond,
+	                std::string("TRACE h=") + hash + " " + name +
+	                    " pc=0x%x t=%u res=%u idx=%x off=%x so=%x v=%x %x %x %x vs=%x %x %x %x\n",
+	                values);
 }
 
 namespace {

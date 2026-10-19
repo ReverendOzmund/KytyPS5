@@ -488,6 +488,10 @@ void DefineInputs(EmitterState& state) {
 		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
 		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
 	}
+	if (TraceShaderEnabled(state)) {
+		add_builtin(IR::StageInputKind::WorkgroupId, 3, "gl_WorkGroupID");
+		add_builtin(IR::StageInputKind::NumWorkgroups, 3, "gl_NumWorkGroups");
+	}
 	if (state.lane_count == 2) {
 		add_builtin(IR::StageInputKind::LocalInvocationIndex, 1, "gl_LocalInvocationIndex");
 		if (std::ranges::any_of(state.inputs, [](const InputBinding& input) {

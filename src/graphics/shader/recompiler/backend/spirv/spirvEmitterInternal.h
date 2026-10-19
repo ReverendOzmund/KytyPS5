@@ -541,6 +541,8 @@ void DefineLoopWatchdogVariables(EmitterState& state);
 [[nodiscard]] uint32_t LoopWatchdogLimit();
 [[nodiscard]] uint64_t LoopPrintfHash();
 [[nodiscard]] bool     LoopPrintfEnabled(const EmitterState& state);
+[[nodiscard]] bool     TraceShaderEnabled(const EmitterState& state);
+void                   EmitTraceMemory(ValueEmitContext& ctx, const IR::Inst& inst);
 uint32_t EmitDebugSample(EmitterState& state, uint32_t& wg_x, uint32_t& wg_y);
 void     EmitDebugPrintf(EmitterState& state, uint32_t condition, const std::string& format,
                          const std::vector<uint32_t>& args);
