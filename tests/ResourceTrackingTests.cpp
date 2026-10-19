@@ -611,6 +611,75 @@ void TestExactUnfilteredImageCandidates() {
         "a later merged query left the unfiltered-use proof intact");
 }
 
+// GTA V (PPSA04263): a shadow lookup selects its depth texture from a table whose placeholder rows
+// are 1x1 RGBA8 UINT images. Vulkan cannot bind an integer image for a depth comparison, so such
+// a candidate row is bound as a null image instead of failing the whole draw.
+void TestDepthCompareTableIntegerRow() {
+  auto fixture = std::make_unique<Fixture>();
+  std::array<Value, 4> words;
+  for (uint32_t i = 0; i < 4u; ++i) words[i] = fixture->UserData(i);
+  const auto table = fixture->Buffer(words);
+  const auto lane_value = fixture->Emit(ValueOpcode::GetAttribute, {Value(0u), Value(0u)});
+  const auto active = fixture->Emit(ValueOpcode::INotEqual32, {lane_value, Value(0u)});
+  const auto key = fixture->Emit(ValueOpcode::ReadFirstLane, {lane_value, active});
+  const auto offset = fixture->Emit(ValueOpcode::IAdd32,
+      {fixture->Emit(ValueOpcode::IMul32, {key, Value(48u)}), Value(16u)});
+  std::array<Value, 8> image_words;
+  for (uint32_t word = 0; word < 8u; ++word) {
+    MemoryInfo memory;
+    memory.kind = ResourceKind::ScalarBuffer;
+    memory.offset = word * 4u;
+    image_words[word] = fixture->Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+                                      fixture->AddMemory(memory, 0x7bcu));
+  }
+  const auto sampler = fixture->Sampler({Value(0u), Value(0u), Value(0u), Value(0u)});
+  MemoryInfo memory;
+  memory.kind = ResourceKind::Image;
+  memory.image_dimension = Decoder::ImageDimension::Dim2D;
+  memory.image_sample_flags = Decoder::ImageSampleFlagCompare;
+  const auto value = fixture->Emit(ValueOpcode::ImageSampleRaw,
+      {fixture->Image(image_words), sampler, fixture->ImageAddress(), active},
+      fixture->AddMemory(memory, 0x299cu));
+  fixture->Emit(ValueOpcode::ReferenceU32,
+                {fixture->Emit(ValueOpcode::CompositeExtractU32x4, {value, Value(0u)})});
+  fixture->PlanAndTrack();
+  const auto plan = ExtractResourcePlan(fixture->program);
+  Check(plan.info.images.size() == 1u && plan.info.images[0].depth_compare &&
+            plan.descriptor_sources[plan.info.images[0].source].indirect_descriptor.has_value(),
+        "depth comparison table lost its indirect image root");
+
+  LinearTestMemory table_memory;
+  const auto image_type_2d = 9u << 28u;
+  // Row 0: a 4x4 32-bit float depth texture. Row 1: a 1x1 RGBA8 UINT placeholder (format 60).
+  const auto depth_format = uint32_t(Libs::Graphics::Prospero::BufferFormat::k32Float);
+  const std::array<uint32_t, 8> depth{0x20u, depth_format << 20u, 3u | (3u << 14u),
+      Libs::Graphics::DstSel(4, 5, 6, 7) | image_type_2d, 0u, 0u, 0u, 0u};
+  const std::array<uint32_t, 8> placeholder{0x40u,
+      uint32_t(Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UInt) << 20u, 0u,
+      Libs::Graphics::DstSel(4, 5, 6, 7) | image_type_2d, 0u, 0u, 0u, 0u};
+  std::copy(depth.begin(), depth.end(), table_memory.words.begin() + 0x1010u / 4u);
+  std::copy(placeholder.begin(), placeholder.end(),
+            table_memory.words.begin() + (0x1010u + 48u) / 4u);
+  std::array<uint32_t, 5> data{0x2000u, 48u << 16u, 2u, 0x5204u, 1u};
+  SrtRuntime runtime{.user_data = data, .userdata = &table_memory,
+                     .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "an integer placeholder row failed the depth comparison table");
+  bool has_depth = false, has_null = false;
+  for (const auto& image : snapshot.images) {
+
+    const auto format = (image.dwords[1] >> 20u) & 0x1ffu;
+    Check(format != uint32_t(Libs::Graphics::Prospero::BufferFormat::k8_8_8_8UInt),
+          "depth comparison bound an integer image");
+    has_depth |= format == depth_format && image.dwords[0] == 0x20u;
+    has_null |= std::ranges::all_of(image.dwords, [](uint32_t word) { return word == 0u; });
+  }
+  Check(has_depth && has_null,
+        "depth comparison table did not keep its depth row and null its placeholder row");
+}
+
 void TestWaterfallImageTable() {
   namespace CFG = Libs::Graphics::ShaderRecompiler::CFG;
   enum class Sources { ScalarFirst, IndexedFirst, DistinctScalars };
@@ -8774,6 +8843,7 @@ int main() {
     Run("bounded image view eligibility", TestBoundedImageViewEligibility);
     Run("exact unfiltered image candidates", TestExactUnfilteredImageCandidates);
     Run("waterfall image table", TestWaterfallImageTable);
+    Run("depth comparison table integer row", TestDepthCompareTableIntegerRow);
     Run("nested pointer image table", TestNestedPointerImageTable);
     Run("indexed pointer image table", TestIndexedPointerImageTable);
     Run("guarded direct image table", TestGuardedDirectImageTable);

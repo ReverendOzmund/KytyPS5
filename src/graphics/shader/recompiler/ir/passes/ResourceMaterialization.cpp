@@ -60,6 +60,14 @@ bool NullImageDescriptor(const DescriptorValue& descriptor) {
 	return descriptor.dwords[0] == 0 && (descriptor.dwords[1] & 0xffu) == 0;
 }
 
+// A depth comparison samples float data only; Vulkan has no integer comparison binding. GTA V's
+// shadow lookups select from a table whose placeholder rows are 1x1 RGBA8 UINT images.
+bool DepthComparableImage(const DescriptorValue& descriptor) {
+	const auto format = static_cast<Prospero::BufferFormat>((descriptor.dwords[1] >> 20u) & 0x1ffu);
+	return Prospero::SampledTextureNumericClass(Prospero::RemapTextureFormat(format)) ==
+	       Prospero::TextureNumericClass::Float;
+}
+
 bool NullBufferDescriptor(Value value) {
 	const auto* handle = value.Resolve().TryInstruction();
 	if (handle == nullptr || handle->GetOpcode() != ValueOpcode::GetBufferResource ||
@@ -1700,7 +1708,8 @@ bool MaterializeResources(const ResourcePlan& program, const SrtRuntime& runtime
 			        specialization.images, [&](DescriptorValue& value) {
 				        // A broad heap also contains resources for other typed image operations.
 				        if (NullImageDescriptor(value) || !ValidImageDescriptor(value, image.r128) ||
-				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension))
+				            (bounded_table && DescriptorDimension(value, image.dimension) != image.dimension) ||
+				            (image.depth_compare && !DepthComparableImage(value)))
 					        value.dwords.fill(0u);
 				        return true;
 			        })) {
