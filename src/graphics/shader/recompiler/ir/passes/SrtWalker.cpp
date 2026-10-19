@@ -2,6 +2,7 @@
 
 #include "common/abi.h"
 #include "common/assert.h"
+#include "common/debugTraceRange.h"
 #include "graphics/shader/recompiler/ir/ShaderIR.h"
 
 #include <xbyak/xbyak.h>
@@ -9,6 +10,7 @@
 #include <algorithm>
 #include <bit>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <map>
 #include <unordered_map>
@@ -55,6 +57,12 @@ SrtRuntime CleanRuntime(SrtRuntime runtime) {
 namespace {
 
 constexpr uint64_t AddressMask = 0x0000ffffffffffffull;
+
+// Debug (KYTY_TRACE_RANGE + KYTY_TRACE_SHADERS): log how a listed shader's scalar table is read.
+bool SrtTraceListed() {
+	return Common::DebugTrace::Enabled() &&
+	       Common::DebugTrace::Listed(Common::DebugTrace::CurrentShader());
+}
 
 bool AddSignedAddress(uint64_t base, int64_t offset, uint64_t& result) {
 	if (base > AddressMask) {
@@ -587,6 +595,12 @@ bool SrtWalker::EvaluateWide(Value value, uint64_t& result) {
 	}
 	if (m_context.values[index].generation == m_context.generation) {
 		result = m_context.values[index].value;
+		if (IsRawRead(m_program, *inst) && SrtTraceListed() && Common::DebugTrace::Budget()) {
+			std::fprintf(stderr, "TRACE-SRTMEMO shader=%016llx index=%u generation=%llu policy=%u value=%llx\n",
+			             static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()), index,
+			             static_cast<unsigned long long>(m_context.generation), m_read_policy,
+			             static_cast<unsigned long long>(result));
+		}
 		return true;
 	}
 	// Visiting and completed-unknown entries both stop repeated evaluation in this
@@ -725,6 +739,12 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 		                      ? static_cast<uint64_t>(static_cast<uint32_t>(records))
 		                      : static_cast<uint64_t>(stride) * static_cast<uint32_t>(records);
 		if (byte_offset > size || size - byte_offset < sizeof(uint32_t)) {
+			if (SrtTraceListed() && Common::DebugTrace::Budget()) {
+				std::fprintf(stderr, "TRACE-SRTREAD shader=%016llx base=0x%llx offset=0x%llx size=0x%llx OOB-ZERO\n",
+				             static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()),
+				             static_cast<unsigned long long>(base), static_cast<unsigned long long>(byte_offset),
+				             static_cast<unsigned long long>(size));
+			}
 			result = 0u;
 			return true;
 		}
@@ -738,13 +758,28 @@ bool SrtWalker::EvaluateRawRead(const Inst& inst, uint64_t& result) {
 	}
 	uint32_t word = 0;
 	const auto reader = vector ? m_runtime.read_specialization_memory : m_runtime.read_memory;
+	const bool trace = SrtTraceListed();
+	uint32_t   probe = 0xeeeeeeeeu;
+	const int  readable = trace ? Common::DebugTrace::ProbeReadable(address, probe) : -2;
 	if (reader != nullptr) {
 		if (!reader(m_runtime.userdata, address, {&word, 1})) {
+			if (trace && Common::DebugTrace::Budget()) {
+				std::fprintf(stderr, "TRACE-SRTREAD shader=%016llx addr=0x%llx vector=%d reader=fn policy=%u readable=%d probe=%x FAILED\n",
+				             static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()),
+				             static_cast<unsigned long long>(address), vector ? 1 : 0, m_read_policy,
+				             readable, probe);
+			}
 			return false;
 		}
 	} else {
 		if (vector) return false;
 		std::memcpy(&word, reinterpret_cast<const void*>(address), sizeof(word));
+	}
+	if (trace && Common::DebugTrace::Budget()) {
+		std::fprintf(stderr, "TRACE-SRTREAD shader=%016llx addr=0x%llx vector=%d reader=%s policy=%u readable=%d probe=%x value=%x\n",
+		             static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()),
+		             static_cast<unsigned long long>(address), vector ? 1 : 0,
+		             reader == nullptr ? "memcpy" : "fn", m_read_policy, readable, probe, word);
 	}
 	result = word;
 	return true;
@@ -1168,6 +1203,15 @@ bool SrtWalker::EvaluateDescriptor(uint32_t source, DescriptorValue& result) {
 
 bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 	if (!m_program.srt_plan_complete) return false;
+	if (SrtTraceListed() && Common::DebugTrace::Budget()) {
+		std::fprintf(stderr, "TRACE-SRTREFRESH shader=%016llx jit=%d read_memory=%d spec=%d clean_eval=%d reads=%zu blocks=%zu\n",
+		             static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()),
+		             m_program.srt_code && m_runtime.read_memory == nullptr ? 1 : 0,
+		             m_runtime.read_memory != nullptr ? 1 : 0,
+		             m_runtime.read_specialization_memory != nullptr ? 1 : 0,
+		             m_clean_evaluator != nullptr ? 1 : 0, m_program.srt_reads.size(),
+		             m_program.control_flow.size());
+	}
 	if (m_program.srt_code && m_runtime.read_memory == nullptr) {
 		flat.resize(m_program.srt_reads.size());
 		m_program.active_sources.clear();
@@ -1185,7 +1229,15 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		if (clean && (m_clean_evaluator == nullptr || m_runtime.read_specialization_memory == nullptr))
 			return false;
 		auto& evaluator = clean ? *m_clean_evaluator : *this;
-		return read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
+		const bool ok = read.flat_offset < flat.size() && evaluator.Evaluate(read.value, flat[read.flat_offset]);
+		if (SrtTraceListed() && Common::DebugTrace::Budget()) {
+			std::fprintf(stderr, "TRACE-SRTSLOT shader=%016llx slot=%u flat=%u clean=%d op=%d ok=%d value=%x\n",
+			             static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()), slot,
+			             read.flat_offset, clean ? 1 : 0,
+			             inst != nullptr ? static_cast<int>(inst->GetOpcode()) : -1, ok ? 1 : 0,
+			             ok && read.flat_offset < flat.size() ? flat[read.flat_offset] : 0xeeeeeeeeu);
+		}
+		return ok;
 	};
 	auto& active = m_program.active_sources;
 	if (m_program.control_flow.empty()) {
@@ -1235,6 +1287,16 @@ bool SrtWalker::RefreshFlatBuffer(std::vector<uint32_t>& flat) {
 		if (m_clean_evaluator != nullptr) m_clean_evaluator->ResetUnknowns();
 	}
 	flat.assign(m_program.srt_reads.size(), 0u);
+	if (SrtTraceListed() && Common::DebugTrace::Budget()) {
+		std::fprintf(stderr, "TRACE-SRTVISIT shader=%016llx visited=", static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()));
+		for (uint32_t index = 0; index < visited.size(); ++index) {
+			if (!visited[index]) continue;
+			std::fprintf(stderr, "%u[", index);
+			for (const auto slot: m_program.control_flow[index].srt_reads) std::fprintf(stderr, "%u,", slot);
+			std::fprintf(stderr, "] ");
+		}
+		std::fprintf(stderr, "\n");
+	}
 	active.assign(m_program.descriptor_sources.size(), 1u);
 	for (const auto& block: m_program.control_flow)
 		for (const auto source: block.sources) active.at(source) = 0u;
