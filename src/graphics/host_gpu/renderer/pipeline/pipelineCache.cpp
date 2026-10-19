@@ -154,7 +154,8 @@ bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) 
 bool ReadShaderScalarMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// The walk evaluates loads the shader may never execute, e.g. through a null SRT pointer, so
 	// unmapped guest memory reads as zeros instead of faulting the host.
-	if (!Libs::LibKernel::Memory::TryReadBacking(address, values.data(), values.size_bytes())) {
+	// Mapped reads wait for GPU writes first, like the specialization reads.
+	if (!Libs::LibKernel::Memory::TryReadBufferBacking(address, values.data(), values.size_bytes())) {
 		std::ranges::fill(values, 0u);
 	}
 	return true;
@@ -401,9 +402,6 @@ struct PipelineCache::ProgramCache {
 		    .read_memory                = ReadShaderScalarMemory,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
-		// Scalar table reads can land on memory an earlier dispatch wrote. Read them through the
-		// GPU-synchronized path, like specialization reads, instead of the raw guest mapping.
-		runtime.read_memory = ReadShaderGuestMemory;
 		ProbeUserPointer("pre", user_data);
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
