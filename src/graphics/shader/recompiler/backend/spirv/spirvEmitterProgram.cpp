@@ -346,7 +346,7 @@ uint32_t LoopWatchdogLimit() {
 }
 
 // Debug: KYTY_LOOP_PRINTF=<hash> prints, through SPIR-V debug printf, the loop header values of
-// that shader's invocations the watchdog stops (first invocation of every 64th workgroup).
+// that shader's invocations the watchdog stops (first invocation of every 8th workgroup).
 uint64_t LoopPrintfHash() {
 	static const uint64_t hash = [] {
 		const char* value = std::getenv("KYTY_LOOP_PRINTF");
@@ -371,7 +371,7 @@ uint32_t EmitDebugSample(EmitterState& state, uint32_t& wg_x, uint32_t& wg_y) {
 		wg_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
 		wg_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
 		const auto grid = Binary(state, spv::OpBitwiseAnd, u,
-		                         Binary(state, spv::OpBitwiseOr, u, wg_x, wg_y), ConstantU32(state, 63));
+		                         Binary(state, spv::OpBitwiseOr, u, wg_x, wg_y), ConstantU32(state, 7));
 		sample = Binary(state, spv::OpLogicalAnd, b, sample,
 		                Binary(state, spv::OpIEqual, b, grid, ConstantU32(state, 0)));
 	}
