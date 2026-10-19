@@ -884,6 +884,26 @@ bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
 	return ok;
 }
 
+// Debug (KYTY_TRACE_*): a guest dword's GPU ownership and page access, read without side effects.
+void DebugProbeWord(const char* tag, uint64_t vaddr) {
+	if (g_gpu_resources == nullptr || !Common::DebugTrace::Budget()) {
+		return;
+	}
+	auto&      buffers = g_gpu_resources->GetBufferCache();
+	const bool tracked = buffers.IsRegionGpuModified(vaddr, sizeof(uint32_t));
+	const bool dirty   = buffers.HasGpuDirtyBytes(vaddr, sizeof(uint32_t));
+	uint32_t   raw     = 0xeeeeeeeeu;
+	const int  readable = Common::DebugTrace::ProbeReadable(vaddr, raw);
+	uint32_t   backing  = 0xeeeeeeeeu;
+	(void)TryReadBacking(vaddr, &backing, sizeof(backing));
+	std::fprintf(stderr,
+	             "TRACE-PROBE %s shader=%016llx addr=0x%llx trk=%d bytes=%d readable=%d raw=%x "
+	             "backing=%x gpu_thread=%d\n",
+	             tag, static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()),
+	             static_cast<unsigned long long>(vaddr), tracked ? 1 : 0, dirty ? 1 : 0, readable, raw,
+	             backing, Graphics::GuestGpu::IsGpuThread() ? 1 : 0);
+}
+
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {
 	EXIT_IF(g_virtual_ranges == nullptr);
 

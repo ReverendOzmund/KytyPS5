@@ -1,6 +1,7 @@
 #include "graphics/host_gpu/renderer/renderContext.h"
 
 #include "common/assert.h"
+#include "common/debugTraceRange.h"
 #include "common/logging/log.h"
 #include "graphics/guest_gpu/graphicsRun.h"
 #include "graphics/presentation/videoOut.h"
@@ -60,6 +61,13 @@ bool RenderContext::HandleFault(PageFaultAccess access, uint64_t fault_vaddr) no
 	constexpr uint64_t fault_size = 1;
 	if (!IsMapped(fault_vaddr, fault_size)) {
 		return false;
+	}
+	if (Common::DebugTrace::Overlaps(fault_vaddr & ~uint64_t {0xfff}, 0x1000) &&
+	    Common::DebugTrace::Budget()) {
+		std::fprintf(stderr, "TRACE-FAULT access=%d addr=0x%llx gpu_thread=%d shader=%016llx\n",
+		             static_cast<int>(access), static_cast<unsigned long long>(fault_vaddr),
+		             GuestGpu::IsGpuThread() ? 1 : 0,
+		             static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()));
 	}
 	if (access == PageFaultAccess::Write) {
 		m_buffer_cache.InvalidateMemory(fault_vaddr, fault_size);

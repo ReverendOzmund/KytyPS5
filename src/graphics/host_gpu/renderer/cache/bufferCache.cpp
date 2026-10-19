@@ -170,6 +170,12 @@ bool BufferCache::DownloadBufferMemory(Buffer& buffer, uint64_t vaddr, uint64_t 
 		    m_memory_tracker.ValidateGpuDirtyPages(m_gpu_modified_ranges, address, bytes,
 		                                           "buffer download");
 		    m_gpu_modified_ranges.ForEachInRange(address, bytes, [&](uint64_t start, uint64_t end) {
+			    if (Common::DebugTrace::Overlaps(start, end - start) && Common::DebugTrace::Budget()) {
+				    std::fprintf(stderr, "TRACE-DOWNLOAD start=0x%llx end=0x%llx buffer=0x%llx async=%d\n",
+				                 static_cast<unsigned long long>(start),
+				                 static_cast<unsigned long long>(end),
+				                 static_cast<unsigned long long>(buffer_address), async ? 1 : 0);
+			    }
 			    copies.emplace_back(start - buffer_address, total_size, end - start);
 			    // Keep packed ranges on separate cache lines, as in shadPS4.
 			    total_size += Common::AlignUp(end - start, 64);
@@ -309,8 +315,23 @@ void BufferCache::ReadMemory(uint64_t vaddr, uint64_t size, bool is_write) {
 		}
 		auto& buffer = m_slot_buffers[FindBuffer(vaddr, size)];
 
-		if (DownloadBufferMemory<false>(buffer, vaddr, size)) {
+		const bool traced = Common::DebugTrace::Overlaps(vaddr & ~uint64_t {0xfff}, 0x1000 + (size & ~uint64_t {0xfff}));
+		if (traced && Common::DebugTrace::Budget()) {
+			std::fprintf(stderr, "TRACE-READMEM addr=0x%llx size=0x%llx write=%d trk=%d bytes=%d shader=%016llx\n",
+			             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+			             is_write ? 1 : 0, m_memory_tracker.IsRegionGpuModified(vaddr, size) ? 1 : 0,
+			             m_gpu_modified_ranges.Intersects(vaddr, size) ? 1 : 0,
+			             static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()));
+		}
+
+		const bool downloaded = DownloadBufferMemory<false>(buffer, vaddr, size);
+		if (downloaded) {
 			m_memory_tracker.UnmarkRegionAsGpuModified(vaddr, size);
+		}
+		if (traced && Common::DebugTrace::Budget()) {
+			std::fprintf(stderr, "TRACE-READMEM-DONE addr=0x%llx downloaded=%d trk=%d\n",
+			             static_cast<unsigned long long>(vaddr), downloaded ? 1 : 0,
+			             m_memory_tracker.IsRegionGpuModified(vaddr, size) ? 1 : 0);
 		}
 		if (is_write) {
 			m_memory_tracker.MarkRegionAsCpuModified(vaddr, size);
@@ -518,10 +539,13 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 		m_gpu_modified_ranges.Add(vaddr, size);
 	}
 	if (Common::DebugTrace::Overlaps(vaddr, size) && Common::DebugTrace::Budget()) {
-		std::fprintf(stderr, "TRACE-BIND shader=%016llx addr=0x%llx size=0x%llx written=%d\n",
+		uint32_t  probe    = 0;
+		const int readable = Common::DebugTrace::ProbeReadable(vaddr, probe);
+		std::fprintf(stderr, "TRACE-BIND shader=%016llx addr=0x%llx size=0x%llx written=%d trk=%d readable=%d\n",
 		             static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()),
 		             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
-		             is_written ? 1 : 0);
+		             is_written ? 1 : 0, m_memory_tracker.IsRegionGpuModified(vaddr, size) ? 1 : 0,
+		             readable);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }

@@ -10,6 +10,11 @@
 #include <cstdlib>
 #include <vector>
 
+#if defined(__linux__)
+#include <sys/uio.h>
+#include <unistd.h>
+#endif
+
 namespace Common::DebugTrace {
 
 struct Range {
@@ -63,6 +68,22 @@ inline bool Listed(uint64_t hash) {
 	for (const auto item: hashes)
 		if (item == hash) return true;
 	return false;
+}
+
+// 1 when the dword at address reads without faulting (the value is stored), 0 when the page is
+// protected, -1 when this host cannot tell. Never touches the page through a faulting access.
+inline int ProbeReadable(uint64_t address, uint32_t& value) {
+#if defined(__linux__)
+	iovec local {&value, sizeof(value)};
+	iovec remote {reinterpret_cast<void*>(address), sizeof(value)};
+	return process_vm_readv(getpid(), &local, 1, &remote, 1, 0) == static_cast<ssize_t>(sizeof(value))
+	           ? 1
+	           : 0;
+#else
+	(void)address;
+	(void)value;
+	return -1;
+#endif
 }
 
 inline bool Budget() {

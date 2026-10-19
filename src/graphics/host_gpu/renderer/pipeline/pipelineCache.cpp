@@ -38,6 +38,10 @@
 #include <vector>
 #include <xxhash.h>
 
+namespace Libs::LibKernel::Memory {
+void DebugProbeWord(const char* tag, uint64_t vaddr);
+} // namespace Libs::LibKernel::Memory
+
 namespace Libs::Graphics {
 
 namespace {
@@ -111,6 +115,19 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values);
 
+
+// Debug (KYTY_TRACE_RANGE + KYTY_TRACE_SHADERS): ownership and page state of the dword at user
+// pointer s[0:1] + 0x90, which the PSR BVH node writer reads as its class-A total.
+void ProbeUserPointer(const char* tag, std::span<const uint32_t> user_data) {
+	if (!Common::DebugTrace::Enabled() || !Common::DebugTrace::Listed(Common::DebugTrace::CurrentShader()) ||
+	    user_data.size() < 2) {
+		return;
+	}
+	const auto address = (static_cast<uint64_t>(user_data[0]) |
+	                      (static_cast<uint64_t>(user_data[1] & 0xffffu) << 32u)) + 0x90u;
+	Libs::LibKernel::Memory::DebugProbeWord(tag, address);
+}
+
 // Debug (KYTY_TRACE_RANGE + KYTY_TRACE_SHADERS): the user data and flattened scalar values a listed
 // shader will see, as read on the CPU when its dispatch is prepared.
 void TraceFlatSrt(uint64_t hash, std::span<const uint32_t> user_data,
@@ -123,20 +140,8 @@ void TraceFlatSrt(uint64_t hash, std::span<const uint32_t> user_data,
 	for (size_t i = 0; i < user_data.size() && i < 16; ++i) std::fprintf(stderr, "%x ", user_data[i]);
 	std::fprintf(stderr, "flat=");
 	for (size_t i = 0; i < flat.size() && i < 24; ++i) std::fprintf(stderr, "%x ", flat[i]);
-	// The dword at user pointer s[0:1] + 0x90: a plain CPU read, then a GPU-synchronized read.
-	if (user_data.size() >= 2) {
-		const auto address = (static_cast<uint64_t>(user_data[0]) |
-		                      (static_cast<uint64_t>(user_data[1] & 0xffffu) << 32u)) + 0x90u;
-		uint32_t raw = 0xeeeeeeeeu;
-		uint32_t synced = 0xeeeeeeeeu;
-		if (Libs::LibKernel::Memory::TryReadBacking(address, &raw, sizeof(raw))) {
-			std::fprintf(stderr, "backing90=%x ", raw);
-		}
-		std::array<uint32_t, 1> word {};
-		if (ReadShaderGuestMemory(nullptr, address, word)) synced = word[0];
-		std::fprintf(stderr, "synced90=%x", synced);
-	}
 	std::fprintf(stderr, "\n");
+	ProbeUserPointer("post", user_data);
 }
 
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
@@ -398,6 +403,7 @@ struct PipelineCache::ProgramCache {
 		};
 		static const bool sync_srt_reads = std::getenv("KYTY_SRT_SYNC_READS") != nullptr;
 		if (sync_srt_reads) runtime.read_memory = ReadShaderGuestMemory;
+		ProbeUserPointer("pre", user_data);
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
 			runtime.indirect_args_address = input_info.indirect_args_address;
