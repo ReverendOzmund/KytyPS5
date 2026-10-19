@@ -7047,6 +7047,88 @@ void TestFiniteBufferSelection() {
   }
 }
 
+// GTA V (PPSA04263) compute 0x5e3e42fe237d3e16: a waterfall stores through V#s read from a scalar
+// table at a ReadFirstLane key, and each thread loads its key from a selector buffer at its own
+// index rather than at a bounded loop induction. Every selector row is reachable, so the keys come
+// from all of the selector V#'s records (plus zero for out-of-bounds rows), and strided OFFEN
+// candidates take the linear stride * records bounds that direct bindings use.
+void TestThreadIndexedWaterfallBufferStore() {
+  auto fixture = std::make_unique<Fixture>();
+  auto& f = *fixture;
+  const auto table = f.Buffer({f.UserData(0u), f.UserData(1u), f.UserData(2u), f.UserData(3u)});
+  const auto selector = f.Buffer({f.UserData(4u), f.UserData(5u), f.UserData(6u), f.UserData(7u)});
+  const auto lane = f.Emit(ValueOpcode::LaneId);
+  const auto active = f.Emit(ValueOpcode::ULessThan32, {lane, Value(8u)});
+  const auto material = f.Emit(ValueOpcode::LoadBufferU32,
+      {selector, lane, Value(0u), Value(0u), active},
+      f.AddMemory({.kind = ResourceKind::Buffer, .idxen = true}, 0x8f0u));
+  const auto masked = f.Emit(ValueOpcode::SelectU32, {active, material, f.Emit(ValueOpcode::UndefU32)});
+  const auto key = f.Emit(ValueOpcode::ReadFirstLane, {masked, active});
+  const auto offset = f.Emit(ValueOpcode::ShiftLeftLogical32, {key, Value(4u)});
+  std::array<Value, 4> words;
+  for (uint32_t word = 0; word < 4u; ++word)
+    words[word] = f.Emit(ValueOpcode::ReadConstBuffer, {table, offset},
+        f.AddMemory({.kind = ResourceKind::ScalarBuffer, .offset = word * 4u,
+                     .component_index = word, .component_count = 4u}, 0x930u));
+  for (uint32_t store = 0; store < 2u; ++store)
+    f.Emit(ValueOpcode::StoreBufferU32,
+        {f.Buffer(words), Value(0u), f.Emit(ValueOpcode::IMul32, {lane, Value(4u)}), Value(0u),
+         Value(42u + store), active},
+        f.AddMemory({.kind = ResourceKind::Buffer, .offset = store * 4u, .offen = true}, 0x93cu + store * 8u));
+  f.PlanAndTrack();
+
+  const auto plan = ExtractResourcePlan(f.program);
+  uint32_t root = UINT32_MAX;
+  for (uint32_t resource = 0; resource < plan.info.buffers.size(); ++resource) {
+    const auto& indirect = plan.descriptor_sources[plan.info.buffers[resource].source].indirect_descriptor;
+    if (!indirect) continue;
+    Check(root == UINT32_MAX && indirect->selector && indirect->selector->stride == 0u &&
+              indirect->key_count.IsEmpty() && indirect->selector_first.IsEmpty() &&
+              indirect->table_stride == 16u && plan.info.buffers[resource].written,
+          "thread-indexed waterfall store did not keep an open indexed selector");
+    root = resource;
+  }
+  Check(root != UINT32_MAX, "thread-indexed waterfall store has no indirect root");
+
+  namespace Prospero = Libs::Graphics::Prospero;
+  LinearTestMemory memory;
+  constexpr uint32_t table_offset = 0x100u, selector_offset = 0x400u;
+  for (uint32_t row = 0; row < 8u; ++row) {
+    // Row 2 is strided with OOB_SELECT 0 (the GTA V heap layout); the others are linear raw V#s.
+    const bool strided = row == 2u;
+    const std::array descriptor{0x100000u + row * 0x10000u, strided ? 4u << 16u : 1u << 16u,
+        strided ? 16u : 64u, (uint32_t(Prospero::BufferFormat::k32UInt) << 12u) |
+            (strided ? 0u : 3u << 28u)};
+    std::copy(descriptor.begin(), descriptor.end(),
+              memory.words.begin() + (table_offset + row * 16u) / 4u);
+  }
+  constexpr std::array keys{2u, 5u, 2u, 7u, 5u, 5u, 2u, 7u};
+  std::copy(keys.begin(), keys.end(), memory.words.begin() + selector_offset / 4u);
+  const std::array<uint32_t, 8> user_data{uint32_t(memory.base) + table_offset, 0u, 8u * 16u, 0x5204u,
+      uint32_t(memory.base) + selector_offset, 4u << 16u, uint32_t(keys.size()), 0x5204u};
+  SrtRuntime runtime{.user_data = user_data, .read_memory = ReadLinearTestMemory,
+      .userdata = &memory, .read_specialization_memory = ReadLinearTestMemory};
+  ResourceSnapshot snapshot;
+  ResourceSpecialization specialization;
+  Check(MaterializeResources(plan, runtime, snapshot, specialization),
+        "thread-indexed waterfall store failed specialization");
+  std::vector<uint32_t> bases;
+  for (uint32_t buffer = 0; buffer < specialization.buffers.size(); ++buffer) {
+    // The root slot holds key zero's row; selected rows follow as its children.
+    if (buffer != root && specialization.buffers[buffer].indirect_root != root) continue;
+    Libs::Graphics::ShaderBufferResource candidate;
+    std::copy_n(snapshot.buffers[buffer].dwords.begin(), 4u, candidate.fields);
+    Check(candidate.Stride() == 1u && candidate.OutOfBounds() == 3u &&
+              candidate.GetSize() == 64u,
+          "thread-indexed waterfall candidate lost its linear raw bounds");
+    bases.push_back(uint32_t(candidate.Base48()));
+  }
+  std::ranges::sort(bases);
+  // Keys 2, 5 and 7 from the selector rows, and key 0 for out-of-bounds rows.
+  Check(bases == std::vector<uint32_t>{0x100000u, 0x120000u, 0x150000u, 0x170000u},
+        "thread-indexed waterfall store did not bind exactly the selected table rows");
+}
+
 void TestPackedScalarBufferSelection() {
   const auto make = [](uint32_t shift_mask = 24u, bool cycle = false, uint32_t store_offset = 0u,
                        bool byte_store = false) {
@@ -8720,6 +8802,7 @@ int main() {
     Run("GPU-selected formatted record store", TestGpuSelectedFormattedRecordStore);
     Run("finite buffer selection", TestFiniteBufferSelection);
     Run("packed scalar buffer selection", TestPackedScalarBufferSelection);
+    Run("thread-indexed waterfall buffer store", TestThreadIndexedWaterfallBufferStore);
     Run("conditional sampler phi", TestConditionalSamplerPhi);
     Run("finite image phi cycle", TestFiniteImagePhiCycle);
     Run("packed descriptor waterfall", TestPackedDescriptorWaterfall);

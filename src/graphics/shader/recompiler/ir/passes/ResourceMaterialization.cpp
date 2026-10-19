@@ -246,6 +246,17 @@ bool NormalizeIndirectBuffer(DescriptorValue& value, bool indexed, const BufferR
 		value.dwords.fill(0u);
 		return true;
 	}
+	if (!indexed && !resource.formatted && descriptor.OutOfBounds() == 0u &&
+	    descriptor.Stride() > 1u && !descriptor.SwizzleEnabled() && !descriptor.AddTid() &&
+	    descriptor.GetSize() <= UINT32_MAX) {
+		// A raw OFFEN access through a strided V# (GTA V selects such V#s from its heap). Direct
+		// bindings bound it by the stride * records byte range; give the candidate that linear
+		// form so both paths agree.
+		value.dwords[1] = (value.dwords[1] & ~(0x3fffu << 16u)) | (1u << 16u);
+		value.dwords[2] = static_cast<uint32_t>(descriptor.GetSize());
+		value.dwords[3] |= 3u << 28u;
+		if (!DecodeBufferDescriptor(value, descriptor)) return false;
+	}
 	if (descriptor.SwizzleEnabled() || descriptor.AddTid() ||
 	    descriptor.OutOfBounds() != (indexed ? 0u : 3u)) {
 		return SpecializationFail(fmt::format(

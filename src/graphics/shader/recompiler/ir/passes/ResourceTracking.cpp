@@ -3313,8 +3313,16 @@ private:
 		DescriptorSource::IndirectDescriptor::SelectorRead selector;
 		const auto* read = IndexedMaterialRead(selected->Arg(1).Resolve().TryInstruction(),
 		                                       selected->Arg(0), selector);
-		if (read == nullptr || !MakeRuntimeTableSource(*read, material_source) ||
-		    !BoundedSelectedIndex(read->Arg(1), read->Arg(4), indirect)) return false;
+		if (read == nullptr || !MakeRuntimeTableSource(*read, material_source)) return false;
+		if (!BoundedSelectedIndex(read->Arg(1), read->Arg(4), indirect)) {
+			// The selector row is not a bounded loop induction (GTA V's 0x5e3e42fe237d3e16 reads
+			// the row at each thread's own index). Any row can then be reached: leave the domain
+			// open so the indexed selector reads every record of the selector V#, plus key zero
+			// for out-of-bounds rows, as GPU image waterfalls already do.
+			indirect.key_count = {};
+			indirect.selector_first = {};
+			indirect.signed_count = false;
+		}
 		selector.source = InternSource(material_source);
 		indirect.selector = std::move(selector);
 		return finish();
