@@ -9,6 +9,8 @@
 #include <cstdio>
 #include <optional>
 
+namespace KytyDebugDispatch { void PrintRecent(); }
+
 namespace Libs::Graphics {
 
 static thread_local CommandScheduler* g_deferred_callback_scheduler = nullptr;
@@ -18,6 +20,7 @@ namespace {
 void ReportVulkanFatal(const char* what, vk::Result result, uint64_t tick, uint32_t debug_op,
                        uint64_t debug_submit, uint32_t arg0, uint32_t arg1, uint32_t arg2,
                        uint32_t arg3, uint64_t arg4) {
+	::KytyDebugDispatch::PrintRecent();
 	LOGF("%s failed: %s (%d), tick=%" PRIu64 " debug_op=%u debug_submit=%" PRIu64
 	     " args=%u,%u,%u,%u,0x%016" PRIx64 "\n",
 	     what, vk::to_string(result).c_str(), static_cast<int>(result), tick, debug_op,

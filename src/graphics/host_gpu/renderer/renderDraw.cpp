@@ -47,6 +47,11 @@
 #include <unordered_map>
 #include <vector>
 
+namespace KytyDebugDispatch {
+int  SyncMode();
+void SyncNote(const char* phase, const char* kind, uint64_t first, uint64_t second);
+} // namespace KytyDebugDispatch
+
 namespace Libs::Graphics {
 
 std::pair<int32_t, uint32_t> ResolveDrawOffsets(uint32_t index_offset,
@@ -1370,6 +1375,14 @@ void RenderExecutor::DrawIndex(uint64_t submit_id, CommandBuffer& buffer,
 
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source,
 	                    primitive_restart);
+	if (KytyDebugDispatch::SyncMode() >= 2) {
+		const auto vs = state.vertex_info[0].stage ? state.vertex_info[0].stage.program->shader_hash : 0u;
+		const auto ps = state.ps_active && state.ps_input_info.stage
+		                    ? state.ps_input_info.stage.program->shader_hash : 0u;
+		KytyDebugDispatch::SyncNote("PENDING", "draw", vs, ps);
+		m_context.GetCommandScheduler().FlushAndWait();
+		KytyDebugDispatch::SyncNote("DONE", "draw", vs, ps);
+	}
 	ResetBindings();
 }
 
@@ -1462,6 +1475,14 @@ void RenderExecutor::DrawAuto(uint64_t submit_id, CommandBuffer& buffer, const D
 
 	DrawIndexBufferSource index_source {};
 	ExecutePreparedDraw(submit_id, buffer, draw, state, topology, emit, index_source, false);
+	if (KytyDebugDispatch::SyncMode() >= 2) {
+		const auto vs = state.vertex_info[0].stage ? state.vertex_info[0].stage.program->shader_hash : 0u;
+		const auto ps = state.ps_active && state.ps_input_info.stage
+		                    ? state.ps_input_info.stage.program->shader_hash : 0u;
+		KytyDebugDispatch::SyncNote("PENDING", "draw", vs, ps);
+		m_context.GetCommandScheduler().FlushAndWait();
+		KytyDebugDispatch::SyncNote("DONE", "draw", vs, ps);
+	}
 	ResetBindings();
 }
 

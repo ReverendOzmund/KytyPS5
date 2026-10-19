@@ -37,6 +37,80 @@
 #include <span>
 #include <unordered_map>
 #include <vector>
+#include <cstdlib>
+#include <cstdio>
+#include <string>
+#include <unordered_set>
+
+// Debug only (GTA V device-lost hunt): KYTY_DEBUG_SKIP_CS=hash[,hash...] skips compute dispatches of
+// those shaders, and the last dispatched compute hashes are printed when a queue submit fails.
+namespace KytyDebugDispatch {
+static std::mutex              g_ring_mutex;
+static std::array<uint64_t, 64> g_ring {};
+static uint64_t                 g_ring_next = 0;
+
+static std::atomic<uint64_t> g_recorded;
+void Record(uint64_t hash) {
+	g_recorded.fetch_add(1, std::memory_order_relaxed);
+	std::scoped_lock lock(g_ring_mutex);
+	g_ring[g_ring_next++ % g_ring.size()] = hash;
+}
+
+void PrintRecent() {
+	std::scoped_lock lock(g_ring_mutex);
+	const auto count = std::min<uint64_t>(g_ring_next, g_ring.size());
+	std::fprintf(stderr, "DEBUG-DISPATCH-RING (oldest first, %llu total):\n",
+	             static_cast<unsigned long long>(g_ring_next));
+	for (uint64_t i = g_ring_next - count; i < g_ring_next; ++i)
+		std::fprintf(stderr, "  cs 0x%016llx\n", static_cast<unsigned long long>(g_ring[i % g_ring.size()]));
+	std::fflush(stderr);
+}
+
+bool Skip(uint64_t hash) {
+	static const std::unordered_set<uint64_t> skipped = [] {
+		std::unordered_set<uint64_t> set;
+		if (const char* value = std::getenv("KYTY_DEBUG_SKIP_CS")) {
+			std::string text(value);
+			size_t start = 0;
+			while (start < text.size()) {
+				auto end = text.find(',', start);
+				if (end == std::string::npos) end = text.size();
+				set.insert(std::strtoull(text.substr(start, end - start).c_str(), nullptr, 16));
+				start = end + 1;
+			}
+		}
+		return set;
+	}();
+	if (skipped.empty() || !skipped.contains(hash)) return false;
+	static std::atomic<uint32_t> logged {0};
+	if (logged.fetch_add(1) < 4)
+		std::fprintf(stderr, "DEBUG-SKIP-CS skipping dispatch of 0x%016llx\n",
+		             static_cast<unsigned long long>(hash));
+	return true;
+}
+// KYTY_DEBUG_SYNC_DISPATCH=1 waits for the GPU after every compute dispatch, =2 also after every
+// draw; KYTY_DEBUG_SYNC_AFTER=n starts that after the n-th recorded compute dispatch. A GPU hang
+// then leaves the guilty work as the last SYNC-PENDING line without a SYNC-DONE.
+int SyncMode() {
+	static const int mode = [] {
+		const char* value = std::getenv("KYTY_DEBUG_SYNC_DISPATCH");
+		return value != nullptr ? std::atoi(value) : 0;
+	}();
+	if (mode == 0) return 0;
+	static const uint64_t after = [] {
+		const char* value = std::getenv("KYTY_DEBUG_SYNC_AFTER");
+		return value != nullptr ? std::strtoull(value, nullptr, 10) : 0ull;
+	}();
+	return g_recorded.load(std::memory_order_relaxed) >= after ? mode : 0;
+}
+
+void SyncNote(const char* phase, const char* kind, uint64_t first, uint64_t second) {
+	std::fprintf(stderr, "SYNC-%s %s 0x%016llx 0x%016llx n=%llu\n", phase, kind,
+	             static_cast<unsigned long long>(first), static_cast<unsigned long long>(second),
+	             static_cast<unsigned long long>(g_recorded.load(std::memory_order_relaxed)));
+	std::fflush(stderr);
+}
+} // namespace KytyDebugDispatch
 
 namespace Libs::Graphics {
 static bool FillSourcesDisjoint(std::span<const ShaderRecompiler::IR::DescriptorValue> sources,
@@ -314,6 +388,8 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
 	if (!compute_program) return;
+	if (KytyDebugDispatch::Skip(input_info.stage.program->shader_hash)) return;
+	KytyDebugDispatch::Record(input_info.stage.program->shader_hash);
 	if (use_thread_dimensions) {
 		input_info.dispatch_threads_num[0]    = thread_group_x;
 		input_info.dispatch_threads_num[1]    = thread_group_y;
@@ -453,6 +529,11 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	// The removed host fence also ordered read-only dispatches before later writers.
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	if (KytyDebugDispatch::SyncMode() >= 1) {
+		KytyDebugDispatch::SyncNote("PENDING", "cs", program.shader_hash, 0);
+		m_context.GetCommandScheduler().FlushAndWait();
+		KytyDebugDispatch::SyncNote("DONE", "cs", program.shader_hash, 0);
+	}
 }
 
 void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
@@ -480,6 +561,8 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
 	if (!compute_program) return;
+	if (KytyDebugDispatch::Skip(input_info.stage.program->shader_hash)) return;
+	KytyDebugDispatch::Record(input_info.stage.program->shader_hash);
 	buffer.EndRendering();
 	auto& pipeline = m_context.GetPipelineCache().GetComputePipeline(input_info, compute_program);
 	auto& bindings = m_compute_bindings;
@@ -522,6 +605,11 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	Common::DebugCounters::Add(Common::DebugCounters::Counter::Dispatches);
 	ShaderAccessBarrier(vk_buffer, vk::PipelineStageFlagBits::eComputeShader);
 	ResetBindings();
+	if (KytyDebugDispatch::SyncMode() >= 1) {
+		KytyDebugDispatch::SyncNote("PENDING", "cs", program.shader_hash, 0);
+		m_context.GetCommandScheduler().FlushAndWait();
+		KytyDebugDispatch::SyncNote("DONE", "cs", program.shader_hash, 0);
+	}
 }
 
 } // namespace Libs::Graphics
