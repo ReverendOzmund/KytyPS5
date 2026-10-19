@@ -109,6 +109,21 @@ void PipelineCacheLog(fmt::format_string<Args...> format, Args&&... args) {
 	Log::WriteToConsoleAndLog(message);
 }
 
+// Debug (KYTY_TRACE_RANGE + KYTY_TRACE_SHADERS): the user data and flattened scalar values a listed
+// shader will see, as read on the CPU when its dispatch is prepared.
+void TraceFlatSrt(uint64_t hash, std::span<const uint32_t> user_data,
+                  const std::vector<uint32_t>& flat) {
+	if (!Common::DebugTrace::Enabled() || !Common::DebugTrace::Listed(hash) ||
+	    !Common::DebugTrace::Budget()) {
+		return;
+	}
+	std::fprintf(stderr, "TRACE-FLAT shader=%016llx ud=", static_cast<unsigned long long>(hash));
+	for (size_t i = 0; i < user_data.size() && i < 16; ++i) std::fprintf(stderr, "%x ", user_data[i]);
+	std::fprintf(stderr, "flat=");
+	for (size_t i = 0; i < flat.size() && i < 24; ++i) std::fprintf(stderr, "%x ", flat[i]);
+	std::fprintf(stderr, "\n");
+}
+
 bool ReadShaderGuestMemory(void*, uint64_t address, std::span<uint32_t> values) {
 	// Scalar and unformatted buffer dependencies use the same backing as native raw loads.
 	// Image synchronization belongs to formatted buffer bindings, not these reads.
@@ -384,6 +399,7 @@ struct PipelineCache::ProgramCache {
 			if (permutation != nullptr) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				TraceFlatSrt(params.hash, user_data, entry->second.resources.flattened_srt);
 				return permutation->handle;
 			}
 		}
@@ -466,6 +482,7 @@ struct PipelineCache::ProgramCache {
 			if (const auto* permutation = entry->second.FindPermutation<true>(runtime, push_data_cursor)) {
 				input_info.stage = {.program = &permutation->program, .resources = &entry->second.resources};
 				permutation->program.bindings.AdvancePushData(push_data_cursor);
+				TraceFlatSrt(params.hash, user_data, entry->second.resources.flattened_srt);
 				return permutation->handle;
 			}
 		}
@@ -475,6 +492,7 @@ struct PipelineCache::ProgramCache {
 		const auto& permutation = entry->second.permutations.back();
 		input_info.stage = {.program = &permutation.program, .resources = &entry->second.resources};
 		permutation.program.bindings.AdvancePushData(push_data_cursor);
+		TraceFlatSrt(params.hash, user_data, entry->second.resources.flattened_srt);
 
 		std::array<size_t, static_cast<size_t>(ShaderType::TessellationEvaluation) + 1> counts {};
 		for (const auto& [key, source]: programs) {

@@ -423,7 +423,7 @@ void EmitTraceMemory(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const std::string name {IR::ValueOpcodeName(inst.GetOpcode())};
 	const bool        store = name.starts_with("StoreBuffer") || name.starts_with("StoreAddress");
 	const bool        load  = name.starts_with("LoadBuffer") || name.starts_with("LoadAddress") ||
-	                  name == "ReadConstBuffer";
+	                  name == "ReadConstBuffer" || name == "ReadConst";
 	const bool atomic = name.starts_with("BufferAtomic");
 	if (!store && !load && !atomic) return;
 	const auto u = TypeU32(state), b = TypeBool(state);
