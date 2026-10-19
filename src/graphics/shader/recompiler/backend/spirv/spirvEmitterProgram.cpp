@@ -345,10 +345,8 @@ uint32_t LoopWatchdogLimit() {
 	return limit;
 }
 
-namespace {
-
 // Debug: KYTY_LOOP_PRINTF=<hash> prints, through SPIR-V debug printf, the loop header values of
-// that shader's invocations the watchdog stops (first invocation of every 16th workgroup).
+// that shader's invocations the watchdog stops (first invocation of every 64th workgroup).
 uint64_t LoopPrintfHash() {
 	static const uint64_t hash = [] {
 		const char* value = std::getenv("KYTY_LOOP_PRINTF");
@@ -356,6 +354,50 @@ uint64_t LoopPrintfHash() {
 	}();
 	return hash;
 }
+
+bool LoopPrintfEnabled(const EmitterState& state) {
+	return LoopWatchdogLimit() != 0 && state.loop_iteration_variable != 0 &&
+	       LoopPrintfHash() == state.program.shader_hash;
+}
+
+uint32_t EmitDebugSample(EmitterState& state, uint32_t& wg_x, uint32_t& wg_y) {
+	const auto u = TypeU32(state), b = TypeBool(state);
+	auto sample = state.subgroup_local_invocation_id_variable == 0
+	    ? ConstantBool(state, true)
+	    : Binary(state, spv::OpIEqual, b, EmitSubgroupLocalInvocationId(state), ConstantU32(state, 0));
+	wg_x = ConstantU32(state, 0xffffffffu);
+	wg_y = wg_x;
+	if (InputVariableForKind(state, IR::StageInputKind::WorkgroupId) != 0) {
+		wg_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
+		wg_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
+		const auto grid = Binary(state, spv::OpBitwiseAnd, u,
+		                         Binary(state, spv::OpBitwiseOr, u, wg_x, wg_y), ConstantU32(state, 63));
+		sample = Binary(state, spv::OpLogicalAnd, b, sample,
+		                Binary(state, spv::OpIEqual, b, grid, ConstantU32(state, 0)));
+	}
+	return sample;
+}
+
+void EmitDebugPrintf(EmitterState& state, uint32_t condition, const std::string& format,
+                     const std::vector<uint32_t>& args) {
+	const auto print_label = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, condition, print_label, merge_label);
+	EmitLabel(state, print_label);
+	state.builder.RequireExtension("SPV_KHR_non_semantic_info");
+	const auto import = state.builder.Import("NonSemantic.DebugPrintf");
+	const auto text   = state.builder.AddString(format.c_str());
+	std::vector<uint32_t> operands {text};
+	operands.insert(operands.end(), args.begin(), args.end());
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeVoid(state), result, import, 1u,
+	                          std::span<const uint32_t>(operands));
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, merge_label);
+}
+
+namespace {
 
 struct LoopPrint {
 	const IR::Block*                     header = nullptr;
@@ -365,23 +407,12 @@ struct LoopPrint {
 
 void EmitLoopPrintf(ValueEmitContext& ctx, const LoopPrint& print, uint32_t count) {
 	auto&      state = ctx.state;
-	const auto u = TypeU32(state), b = TypeBool(state);
-	auto sample = state.subgroup_local_invocation_id_variable == 0
-	    ? ConstantBool(state, true)
-	    : Binary(state, spv::OpIEqual, b, EmitSubgroupLocalInvocationId(state), ConstantU32(state, 0));
-	uint32_t wg_x = ConstantU32(state, 0xffffffffu), wg_y = wg_x;
-	if (InputVariableForKind(state, IR::StageInputKind::WorkgroupId) != 0) {
-		wg_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
-		wg_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
-		const auto grid = Binary(state, spv::OpBitwiseAnd, u,
-		                         Binary(state, spv::OpBitwiseOr, u, wg_x, wg_y), ConstantU32(state, 15));
-		sample = Binary(state, spv::OpLogicalAnd, b, sample,
-		                Binary(state, spv::OpIEqual, b, grid, ConstantU32(state, 0)));
-	}
-	std::string format = "LOOPCAP pc=0x%x hdr=0x%x wg=%u,%u it=%u";
+	const auto u = TypeU32(state);
+	uint32_t   wg_x = 0, wg_y = 0;
+	const auto sample = EmitDebugSample(state, wg_x, wg_y);
+	std::string format = "LOOPCAP pc=0x%x wg=%u,%u it=%u";
 	std::vector<uint32_t> args;
 	args.push_back(ConstantU32(state, print.body->start_pc));
-	args.push_back(ConstantU32(state, print.header->start_pc));
 	args.push_back(wg_x);
 	args.push_back(wg_y);
 	args.push_back(count);
@@ -400,21 +431,8 @@ void EmitLoopPrintf(ValueEmitContext& ctx, const LoopPrint& print, uint32_t coun
 		format += " v" + std::to_string(print.ids->at(&inst)) + "=%x";
 		args.push_back(word);
 	}
-	const auto print_label = state.builder.AllocateId();
-	const auto merge_label = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
-	state.builder.AddFunction(spv::OpBranchConditional, sample, print_label, merge_label);
-	EmitLabel(state, print_label);
-	state.builder.RequireExtension("SPV_KHR_non_semantic_info");
-	const auto import = state.builder.Import("NonSemantic.DebugPrintf");
-	const auto text   = state.builder.AddString(format.c_str());
-	std::vector<uint32_t> operands {text};
-	operands.insert(operands.end(), args.begin(), args.end());
-	const auto result = state.builder.AllocateId();
-	state.builder.AddFunction(spv::OpExtInst, TypeVoid(state), result, import, 1u,
-	                          std::span<const uint32_t>(operands));
-	state.builder.AddFunction(spv::OpBranch, merge_label);
-	EmitLabel(state, merge_label);
+	format += "\n";
+	EmitDebugPrintf(state, sample, format, args);
 }
 
 void EmitFaultedLoopWatchdog(ValueEmitContext& ctx, const LoopPrint* print) {

@@ -150,6 +150,7 @@ private:
 	std::vector<uint32_t>                     m_memory_model;
 	std::vector<uint32_t>                     m_entry_points;
 	std::vector<uint32_t>                     m_execution_modes;
+	std::vector<uint32_t>                     m_debug_strings;
 	std::vector<uint32_t>                     m_debug;
 	std::vector<uint32_t>                     m_annotations;
 	std::vector<uint32_t>                     m_declarations;

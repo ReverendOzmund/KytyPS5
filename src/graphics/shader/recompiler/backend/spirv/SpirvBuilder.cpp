@@ -164,7 +164,8 @@ uint32_t Builder::AddString(const char* text) {
 	const auto id = AllocateId();
 	std::vector<uint32_t> operands = {id};
 	AppendString(operands, text);
-	AppendInstruction(m_debug, spv::OpString, operands);
+	// OpString precedes OpName in the debug section, however late a string is added.
+	AppendInstruction(m_debug_strings, spv::OpString, operands);
 	return id;
 }
 
@@ -207,7 +208,7 @@ std::vector<uint32_t> Builder::Build() const {
 	std::vector<uint32_t> module;
 	module.reserve(5u + m_capabilities.size() + m_extensions.size() + m_ext_inst_imports.size() +
 	               m_memory_model.size() + m_entry_points.size() + m_execution_modes.size() +
-	               m_debug.size() + m_annotations.size() + m_declarations.size() +
+	               m_debug_strings.size() + m_debug.size() + m_annotations.size() + m_declarations.size() +
 	               m_functions.size());
 
 	module.push_back(spv::MagicNumber);
@@ -222,6 +223,7 @@ std::vector<uint32_t> Builder::Build() const {
 	module.insert(module.end(), m_memory_model.begin(), m_memory_model.end());
 	module.insert(module.end(), m_entry_points.begin(), m_entry_points.end());
 	module.insert(module.end(), m_execution_modes.begin(), m_execution_modes.end());
+	module.insert(module.end(), m_debug_strings.begin(), m_debug_strings.end());
 	module.insert(module.end(), m_debug.begin(), m_debug.end());
 	module.insert(module.end(), m_annotations.begin(), m_annotations.end());
 	module.insert(module.end(), m_declarations.begin(), m_declarations.end());

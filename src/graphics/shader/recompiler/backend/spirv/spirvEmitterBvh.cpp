@@ -1,5 +1,8 @@
 #include "graphics/shader/recompiler/backend/spirv/spirvEmitterInstructions.h"
 
+#include <string>
+#include <vector>
+
 namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter {
 namespace {
 
@@ -324,6 +327,75 @@ void DefineBvhIntersect(EmitterState& s) {
 	s.builder.AddFunction(spv::OpFunctionEnd);
 }
 
+// Debug (KYTY_LOOP_PRINTF): near the loop watchdog limit, print the BVH call, the node it reads
+// and the start of the BVH it belongs to, as the shader sees them through the BDA page table.
+void EmitBvhDebug(EmitterState& s, uint32_t descriptor, uint32_t node, uint32_t extent,
+                  uint32_t origin, uint32_t direction, uint32_t result) {
+	const auto u = TypeU32(s), wide = TypeU64(s), b = TypeBool(s), f = TypeF32(s);
+	const auto pc = s.current_block != nullptr ? s.current_block->start_pc : 0u;
+	uint32_t   wg_x = 0, wg_y = 0;
+	auto       sample = EmitDebugSample(s, wg_x, wg_y);
+	const auto count  = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpLoad, u, count, s.loop_iteration_variable);
+	const auto limit = LoopWatchdogLimit();
+	sample = Binary(s, spv::OpLogicalAnd, b, sample,
+	                Binary(s, spv::OpUGreaterThanEqual, b, count,
+	                       ConstantU32(s, limit > 3u ? limit - 3u : 0u)));
+	const auto print_label = s.builder.AllocateId(), merge_label = s.builder.AllocateId();
+	s.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	s.builder.AddFunction(spv::OpBranchConditional, sample, print_label, merge_label);
+	EmitLabel(s, print_label);
+	std::array<uint32_t, 4> words, results;
+	for (uint32_t i = 0; i < 4; ++i) {
+		words[i]   = Extract(s, u, descriptor, i);
+		results[i] = Extract(s, u, result, i);
+	}
+	const auto base = Binary(s, spv::OpShiftLeftLogical, wide,
+	    PackU64(s, words[0], Binary(s, spv::OpBitwiseAnd, u, words[1], ConstantU32(s, 0xff))),
+	    ConstantU32(s, 8));
+	const auto node_address = Binary(s, spv::OpIAdd, wide, base,
+	    Binary(s, spv::OpShiftLeftLogical, wide,
+	           Binary(s, spv::OpShiftRightLogical, wide, node, ConstantU32(s, 3)), ConstantU32(s, 6)));
+	const auto load = [&](uint32_t address) {
+		const auto pointer = GetBdaPointer(s, address);
+		return EmitValueOrDefaultIfCondition(s,
+		    Binary(s, spv::OpINotEqual, b, pointer, ConstantU64(s, 0)), u, ConstantU32(s, 0xdeadbeefu),
+		    [&] {
+			    const auto typed = Unary(s, spv::OpConvertUToPtr, TypePhysicalU32Pointer(s), pointer);
+			    const auto value = s.builder.AllocateId();
+			    s.builder.AddFunction(spv::OpLoad, u, value, typed, spv::MemoryAccessAlignedMask, 4u);
+			    return value;
+		    });
+	};
+	const auto dump = [&](const char* tag, uint32_t address, uint32_t first) {
+		std::string format = std::string(tag) + " pc=0x%x wg=%u,%u it=%u w" + std::to_string(first) + ":";
+		std::vector<uint32_t> args {ConstantU32(s, pc), wg_x, wg_y, count};
+		for (uint32_t i = 0; i < 16; ++i) {
+			format += " %x";
+			args.push_back(load(Binary(s, spv::OpIAdd, wide, address, ConstantU64(s, i * 4u))));
+		}
+		EmitDebugPrintf(s, ConstantBool(s, true), format + "\n", args);
+	};
+	std::vector<uint32_t> call {ConstantU32(s, pc), wg_x, wg_y, count,
+	                            Unary(s, spv::OpUConvert, u,
+	                                  Binary(s, spv::OpShiftRightLogical, wide, node, ConstantU32(s, 32))),
+	                            Unary(s, spv::OpUConvert, u, node),
+	                            words[0], words[1], words[2], words[3],
+	                            Unary(s, spv::OpBitcast, u, extent)};
+	for (const auto vector: {origin, direction})
+		for (uint32_t i = 0; i < 3; ++i) call.push_back(Unary(s, spv::OpBitcast, u, Extract(s, f, vector, i)));
+	call.insert(call.end(), results.begin(), results.end());
+	EmitDebugPrintf(s, ConstantBool(s, true),
+	                "BVHCALL pc=0x%x wg=%u,%u it=%u node=%x:%x desc=%x %x %x %x ext=%x "
+	                "o=%x %x %x d=%x %x %x res=%x %x %x %x\n", call);
+	dump("BVHNODE", node_address, 0);
+	dump("BVHNODE", Binary(s, spv::OpIAdd, wide, node_address, ConstantU64(s, 64)), 16);
+	for (uint32_t i = 0; i < 4; ++i)
+		dump("BVHHDR", Binary(s, spv::OpIAdd, wide, base, ConstantU64(s, i * 64u)), i * 16u);
+	s.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(s, merge_label);
+}
+
 uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	auto& s = ctx.state;
 	const auto* ray = ctx.ImageAddress(inst.Arg(1));
@@ -343,13 +415,16 @@ uint32_t EmitBvhIntersect(ValueEmitContext& ctx, const IR::Inst& inst) {
 	const auto extent = Unary(s, spv::OpBitcast, TypeF32(s), ctx.Arg(*ray, node_words));
 	const auto origin = vector(node_words + 1u), direction = vector(node_words + 4u),
 	           inverse = vector(node_words + 7u);
-	return EmitValueOrDefaultIfCondition(s, ctx.Arg(inst, 2), TypeU32Vector(s, 4),
+	const auto value = EmitValueOrDefaultIfCondition(s, ctx.Arg(inst, 2), TypeU32Vector(s, 4),
 	    ConstantU32CompositeZero(s, 4), [&] {
 		const auto result = s.builder.AllocateId();
 		s.builder.AddFunction(spv::OpFunctionCall, TypeU32Vector(s, 4), result,
 		    s.bvh_intersect_function, descriptor, node, extent, origin, direction, inverse);
 		return result;
 	});
+	if (s.lane_half == 0 && LoopPrintfEnabled(s))
+		EmitBvhDebug(s, descriptor, node, extent, origin, direction, value);
+	return value;
 }
 
 } // namespace Libs::Graphics::ShaderRecompiler::Spirv::Emitter

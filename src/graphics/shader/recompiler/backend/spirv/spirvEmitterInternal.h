@@ -539,6 +539,11 @@ void EmitProgram(EmitterState& state);
 void DefineGetBdaPointer(EmitterState& state);
 void DefineLoopWatchdogVariables(EmitterState& state);
 [[nodiscard]] uint32_t LoopWatchdogLimit();
+[[nodiscard]] uint64_t LoopPrintfHash();
+[[nodiscard]] bool     LoopPrintfEnabled(const EmitterState& state);
+uint32_t EmitDebugSample(EmitterState& state, uint32_t& wg_x, uint32_t& wg_y);
+void     EmitDebugPrintf(EmitterState& state, uint32_t condition, const std::string& format,
+                         const std::vector<uint32_t>& args);
 void DefineIndirectBufferFormats(ValueEmitContext& ctx);
 void DefineIndirectBufferLoads(ValueEmitContext& ctx);
 void DefineBvhIntersect(EmitterState& state);
