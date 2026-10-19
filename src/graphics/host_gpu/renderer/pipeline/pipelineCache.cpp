@@ -401,8 +401,9 @@ struct PipelineCache::ProgramCache {
 		    .read_memory                = ReadShaderScalarMemory,
 		    .read_specialization_memory = ReadShaderGuestMemory,
 		};
-		static const bool sync_srt_reads = std::getenv("KYTY_SRT_SYNC_READS") != nullptr;
-		if (sync_srt_reads) runtime.read_memory = ReadShaderGuestMemory;
+		// Scalar table reads can land on memory an earlier dispatch wrote. Read them through the
+		// GPU-synchronized path, like specialization reads, instead of the raw guest mapping.
+		runtime.read_memory = ReadShaderGuestMemory;
 		ProbeUserPointer("pre", user_data);
 		if constexpr (std::is_same_v<InputInfo, ShaderComputeInputInfo>) {
 			runtime.workgroup_counts = input_info.workgroup_counts;
