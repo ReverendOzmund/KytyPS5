@@ -7,6 +7,9 @@
 #include <cstdlib>
 #include <bit>
 #include <functional>
+#include <map>
+#include <string>
+#include <vector>
 #include <optional>
 #include <type_traits>
 #include <unordered_set>
@@ -344,7 +347,78 @@ uint32_t LoopWatchdogLimit() {
 
 namespace {
 
-void EmitFaultedLoopWatchdog(EmitterState& state) {
+// Debug: KYTY_LOOP_PRINTF=<hash> prints, through SPIR-V debug printf, the loop header values of
+// that shader's invocations the watchdog stops (first invocation of every 16th workgroup).
+uint64_t LoopPrintfHash() {
+	static const uint64_t hash = [] {
+		const char* value = std::getenv("KYTY_LOOP_PRINTF");
+		return value != nullptr ? static_cast<uint64_t>(std::strtoull(value, nullptr, 16)) : 0u;
+	}();
+	return hash;
+}
+
+struct LoopPrint {
+	const IR::Block*                     header = nullptr;
+	const IR::Block*                     body   = nullptr;
+	const std::map<const IR::Inst*, size_t>* ids = nullptr;
+};
+
+void EmitLoopPrintf(ValueEmitContext& ctx, const LoopPrint& print, uint32_t count) {
+	auto&      state = ctx.state;
+	const auto u = TypeU32(state), b = TypeBool(state);
+	auto sample = state.subgroup_local_invocation_id_variable == 0
+	    ? ConstantBool(state, true)
+	    : Binary(state, spv::OpIEqual, b, EmitSubgroupLocalInvocationId(state), ConstantU32(state, 0));
+	uint32_t wg_x = ConstantU32(state, 0xffffffffu), wg_y = wg_x;
+	if (InputVariableForKind(state, IR::StageInputKind::WorkgroupId) != 0) {
+		wg_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
+		wg_y = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 1);
+		const auto grid = Binary(state, spv::OpBitwiseAnd, u,
+		                         Binary(state, spv::OpBitwiseOr, u, wg_x, wg_y), ConstantU32(state, 15));
+		sample = Binary(state, spv::OpLogicalAnd, b, sample,
+		                Binary(state, spv::OpIEqual, b, grid, ConstantU32(state, 0)));
+	}
+	std::string format = "LOOPCAP pc=0x%x hdr=0x%x wg=%u,%u it=%u";
+	std::vector<uint32_t> args;
+	args.push_back(ConstantU32(state, print.body->start_pc));
+	args.push_back(ConstantU32(state, print.header->start_pc));
+	args.push_back(wg_x);
+	args.push_back(wg_y);
+	args.push_back(count);
+	for (const auto& inst: *print.header) {
+		if (inst.GetOpcode() != IR::ValueOpcode::Phi || args.size() >= 48u) continue;
+		const auto value = ctx.Def(IR::Value(const_cast<IR::Inst*>(&inst)));
+		uint32_t   word  = 0;
+		switch (inst.GetType()) {
+			case IR::Type::U32: word = value; break;
+			case IR::Type::F32: word = Unary(state, spv::OpBitcast, u, value); break;
+			case IR::Type::U1:
+				word = Select(state, u, value, ConstantU32(state, 1), ConstantU32(state, 0));
+				break;
+			default: continue;
+		}
+		format += " v" + std::to_string(print.ids->at(&inst)) + "=%x";
+		args.push_back(word);
+	}
+	const auto print_label = state.builder.AllocateId();
+	const auto merge_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, merge_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, sample, print_label, merge_label);
+	EmitLabel(state, print_label);
+	state.builder.RequireExtension("SPV_KHR_non_semantic_info");
+	const auto import = state.builder.Import("NonSemantic.DebugPrintf");
+	const auto text   = state.builder.AddString(format.c_str());
+	std::vector<uint32_t> operands {text};
+	operands.insert(operands.end(), args.begin(), args.end());
+	const auto result = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpExtInst, TypeVoid(state), result, import, 1u,
+	                          std::span<const uint32_t>(operands));
+	state.builder.AddFunction(spv::OpBranch, merge_label);
+	EmitLabel(state, merge_label);
+}
+
+void EmitFaultedLoopWatchdog(ValueEmitContext& ctx, const LoopPrint* print) {
+	auto&      state = ctx.state;
 	const auto u     = TypeU32(state);
 	const auto count = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, u, count, state.loop_iteration_variable);
@@ -364,6 +438,7 @@ void EmitFaultedLoopWatchdog(EmitterState& state) {
 	state.builder.AddFunction(spv::OpSelectionMerge, continue_label, spv::SelectionControlMaskNone);
 	state.builder.AddFunction(spv::OpBranchConditional, stop, return_label, continue_label);
 	EmitLabel(state, return_label);
+	if (print != nullptr) EmitLoopPrintf(ctx, *print, next);
 	state.builder.AddFunction(spv::OpReturn);
 	EmitLabel(state, continue_label);
 }
@@ -387,7 +462,7 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
 	// The first block of each loop body, entered once per iteration.
-	std::unordered_set<const IR::Block*> loop_bodies;
+	std::map<const IR::Block*, const IR::Block*> loop_bodies;
 	if (ctx.state.bda_fault_variable != 0) {
 		for (const auto* block: program.blocks) {
 			const auto& term = block->terminator;
@@ -400,7 +475,7 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 			// OpLoopMerge or back edge out of the block the structured rules require.
 			if (body != nullptr && body != term.merge_block && body != term.continue_block &&
 			    !body->terminator.loop_header)
-				loop_bodies.insert(body);
+				loop_bodies.emplace(body, block);
 		}
 	}
 	if (!loop_bodies.empty() && LoopWatchdogLimit() != 0) {
@@ -408,13 +483,34 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 		             static_cast<unsigned long long>(program.shader_hash), loop_bodies.size(),
 		             LoopWatchdogLimit());
 	}
-	const std::function<void()> watchdog = [&] { EmitFaultedLoopWatchdog(ctx.state); };
+	std::map<const IR::Inst*, size_t> ids;
+	const bool print_loops = !loop_bodies.empty() && LoopWatchdogLimit() != 0 &&
+	                         LoopPrintfHash() == program.shader_hash;
+	if (print_loops) {
+		// Same numbering as ProgramToString, so the printed values can be matched with this dump.
+		size_t next_id = 1;
+		for (const auto* block: program.blocks)
+			for (const auto& inst: *block) ids.emplace(&inst, next_id++);
+		std::fprintf(stderr, "LOOPCAP-IR-BEGIN hash=0x%016llx\n%s\nLOOPCAP-IR-END\n",
+		             static_cast<unsigned long long>(program.shader_hash),
+		             IR::ProgramToString(program).c_str());
+		for (const auto& [body, header]: loop_bodies)
+			std::fprintf(stderr, "LOOPCAP-LOOP body=0x%x header_block=0x%x\n", body->start_pc,
+			             header->start_pc);
+	}
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
+		std::function<void()> watchdog;
+		if (const auto found = loop_bodies.find(block); found != loop_bodies.end()) {
+			const LoopPrint print {.header = found->second, .body = block, .ids = &ids};
+			watchdog = [&ctx, print, print_loops] {
+				EmitFaultedLoopWatchdog(ctx, print_loops ? &print : nullptr);
+			};
+		}
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
-		}, loop_bodies.contains(block) ? watchdog : std::function<void()> {});
+		}, watchdog);
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block);
 	}
