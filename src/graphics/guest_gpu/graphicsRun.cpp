@@ -1,6 +1,7 @@
 #include "graphics/guest_gpu/graphicsRun.h"
 
 #include "common/assert.h"
+#include "common/debugTraceRange.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
 #include "common/logging/log.h"
@@ -1003,6 +1004,11 @@ void CommandProcessor::DispatchIndirect(uint64_t args_addr, uint32_t mode) {
 	EXIT_NOT_IMPLEMENTED(args_addr == 0 || (args_addr & 3u) != 0);
 	if ((mode & Pm4::COMPUTE_DISPATCH_INITIATOR_USE_THREAD_DIMENSIONS) != 0) {
 		const auto* args = reinterpret_cast<const vk::DispatchIndirectCommand*>(args_addr);
+		if (Common::DebugTrace::Enabled() && Common::DebugTrace::Budget()) {
+			std::fprintf(stderr, "TRACE-INDIRECT-CPU cs=0x%llx args=0x%llx groups=%ux%ux%u\n",
+			             static_cast<unsigned long long>(m_sh_ctx.GetCs().cs_regs.data_addr),
+			             static_cast<unsigned long long>(args_addr), args->x, args->y, args->z);
+		}
 		DispatchDirect(args->x, args->y, args->z, mode);
 		return;
 	}

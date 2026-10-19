@@ -1,4 +1,5 @@
 #include "common/assert.h"
+#include "common/debugTraceRange.h"
 #include "common/common.h"
 #include "common/debugCounters.h"
 #include "common/emulatorConfig.h"
@@ -387,6 +388,12 @@ void RenderExecutor::DispatchDirect(uint64_t submit_id, CommandBuffer& buffer,
 	}
 	const auto compute_program =
 	    m_context.GetPipelineCache().GetComputeProgram(cs_regs, sh_regs, input_info);
+	if (Common::DebugTrace::Enabled() && Common::DebugTrace::Listed(Common::DebugTrace::CurrentShader()) &&
+	    Common::DebugTrace::Budget()) {
+		std::fprintf(stderr, "TRACE-DISPATCH shader=%016llx groups=%ux%ux%u ok=%d\n",
+		             static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()),
+		             thread_group_x, thread_group_y, thread_group_z, compute_program ? 1 : 0);
+	}
 	if (!compute_program) return;
 	if (KytyDebugDispatch::Skip(input_info.stage.program->shader_hash)) return;
 	KytyDebugDispatch::Record(input_info.stage.program->shader_hash);
@@ -546,10 +553,21 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	                    0, mode, buffer.GetShaders().GetCs().cs_regs.data_addr);
 	Common::LockGuard lock(m_context.GetMutex());
 	vk::DispatchIndirectCommand args {};
-	if (!m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args)) &&
+	const bool args_dirty = m_context.GetBufferCache().HasGpuDirtyBytes(args_addr, sizeof(args));
+	if (!args_dirty &&
 	    LibKernel::Memory::TryReadBacking(args_addr, &args, sizeof(args)) &&
 	    (args.x == 0 || args.y == 0 || args.z == 0)) {
+		if (Common::DebugTrace::Enabled() && Common::DebugTrace::Budget()) {
+			std::fprintf(stderr, "TRACE-INDIRECT-SKIP cs=0x%llx args=0x%llx groups=%ux%ux%u\n",
+			             static_cast<unsigned long long>(buffer.GetShaders().GetCs().cs_regs.data_addr),
+			             static_cast<unsigned long long>(args_addr), args.x, args.y, args.z);
+		}
 		return;
+	}
+	if (Common::DebugTrace::Enabled() && Common::DebugTrace::Budget()) {
+		std::fprintf(stderr, "TRACE-INDIRECT cs=0x%llx args=0x%llx dirty=%d\n",
+		             static_cast<unsigned long long>(buffer.GetShaders().GetCs().cs_regs.data_addr),
+		             static_cast<unsigned long long>(args_addr), args_dirty ? 1 : 0);
 	}
 	const auto& cs_regs = buffer.GetShaders().GetCs();
 	if (cs_regs.cs_regs.data_addr == 0) {
@@ -560,6 +578,12 @@ void RenderExecutor::DispatchIndirect(uint64_t submit_id, CommandBuffer& buffer,
 	input_info.indirect_args_address = args_addr;
 	const auto compute_program = m_context.GetPipelineCache().GetComputeProgram(
 	    cs_regs, buffer.GetRegisters().GetShaderRegisters(), input_info);
+	if (Common::DebugTrace::Enabled() && Common::DebugTrace::Listed(Common::DebugTrace::CurrentShader()) &&
+	    Common::DebugTrace::Budget()) {
+		std::fprintf(stderr, "TRACE-DISPATCH-INDIRECT shader=%016llx args=0x%llx ok=%d\n",
+		             static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()),
+		             static_cast<unsigned long long>(args_addr), compute_program ? 1 : 0);
+	}
 	if (!compute_program) return;
 	if (KytyDebugDispatch::Skip(input_info.stage.program->shader_hash)) return;
 	KytyDebugDispatch::Record(input_info.stage.program->shader_hash);

@@ -1,6 +1,7 @@
 #include "kernel/memory.h"
 
 #include "common/assert.h"
+#include "common/debugTraceRange.h"
 #include "common/logging/log.h"
 #include "common/stringUtils.h"
 #include "common/threads.h"
@@ -859,16 +860,28 @@ bool TryReadBacking(uint64_t vaddr, void* data, uint64_t size) {
 }
 
 bool TryReadBufferBacking(uint64_t vaddr, void* data, uint64_t size) {
+	int dirty = -1;
 	if (g_gpu_resources != nullptr && IsGpuAddressRange(vaddr, size)) {
 		if (!Graphics::GuestGpu::IsGpuThread()) {
 			return false;
 		}
 		auto& buffers = GetGpuResources().GetBufferCache();
-		if (buffers.HasGpuDirtyBytes(vaddr, size)) {
+		dirty = buffers.HasGpuDirtyBytes(vaddr, size) ? 1 : 0;
+		if (dirty == 1) {
 			buffers.ReadMemory(vaddr, size);
 		}
 	}
-	return TryReadBacking(vaddr, data, size);
+	const bool ok = TryReadBacking(vaddr, data, size);
+	if (Common::DebugTrace::Overlaps(vaddr, size) && Common::DebugTrace::Budget()) {
+		const auto* words = static_cast<const uint32_t*>(data);
+		std::fprintf(stderr, "TRACE-SRT-READ shader=%016llx addr=0x%llx size=0x%llx dirty=%d ok=%d v=",
+		             static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()),
+		             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+		             dirty, ok ? 1 : 0);
+		for (uint64_t i = 0; ok && i < size / 4 && i < 16; ++i) std::fprintf(stderr, "%x ", words[i]);
+		std::fprintf(stderr, "\n");
+	}
+	return ok;
 }
 
 uint64_t ClampRangeSize(uint64_t vaddr, uint64_t size) {

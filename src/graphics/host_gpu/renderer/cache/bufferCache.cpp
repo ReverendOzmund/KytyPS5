@@ -2,6 +2,7 @@
 
 #include "common/alignment.h"
 #include "common/assert.h"
+#include "common/debugTraceRange.h"
 #include "common/debugCounters.h"
 #include "common/logging/log.h"
 #include "common/profiler.h"
@@ -515,6 +516,12 @@ std::pair<Buffer*, uint64_t> BufferCache::ObtainBuffer(uint64_t vaddr, uint64_t 
 	(void)SynchronizeBuffer(buffer, vaddr, size, is_written, is_texel_buffer);
 	if (is_written) {
 		m_gpu_modified_ranges.Add(vaddr, size);
+	}
+	if (Common::DebugTrace::Overlaps(vaddr, size) && Common::DebugTrace::Budget()) {
+		std::fprintf(stderr, "TRACE-BIND shader=%016llx addr=0x%llx size=0x%llx written=%d\n",
+		             static_cast<unsigned long long>(Common::DebugTrace::CurrentShader()),
+		             static_cast<unsigned long long>(vaddr), static_cast<unsigned long long>(size),
+		             is_written ? 1 : 0);
 	}
 	return {&buffer, buffer.Offset(vaddr)};
 }
