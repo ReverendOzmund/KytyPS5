@@ -115,6 +115,8 @@ struct EmitterState {
 	uint32_t                                         bda_pagetable_variable  = 0;
 	uint32_t                                         fault_buffer_variable   = 0;
 	uint32_t                                         bda_pointer_function    = 0;
+	uint32_t                                         bda_fault_variable      = 0;
+	uint32_t                                         loop_iteration_variable = 0;
 	uint32_t                                         indirect_format_function = 0;
 	uint32_t                                         indirect_format_geometry_function = 0;
 	std::map<std::array<uint32_t, 3>, uint32_t>        indirect_buffer_load_functions;

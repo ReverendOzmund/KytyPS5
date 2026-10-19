@@ -1362,6 +1362,14 @@ void DefineGetBdaPointer(EmitterState& state) {
 	if (!state.program.info.uses_dma) {
 		return;
 	}
+	// Per-invocation: whether a BDA read found its page unmapped (it reads zero until the fault is
+	// serviced after the dispatch), and how many loop iterations the invocation has run.
+	const auto private_u32 = TypePointer(state, spv::StorageClassPrivate, TypeU32(state));
+	state.bda_fault_variable = state.builder.DefineGlobalVariable(private_u32, spv::StorageClassPrivate);
+	state.loop_iteration_variable =
+	    state.builder.DefineGlobalVariable(private_u32, spv::StorageClassPrivate);
+	state.builder.AddName(state.bda_fault_variable, "bda_faulted");
+	state.builder.AddName(state.loop_iteration_variable, "loop_iterations");
 	const auto type            = TypeU64(state);
 	const auto function_type   = state.builder.Type(spv::OpTypeFunction, type, type);
 	state.bda_pointer_function = state.builder.AllocateId();
@@ -1398,6 +1406,7 @@ void DefineGetBdaPointer(EmitterState& state) {
 
 	EmitLabel(state, fault_label);
 	RecordBdaFault(state, page);
+	state.builder.AddFunction(spv::OpStore, state.bda_fault_variable, ConstantU32(state, 1));
 	state.builder.AddFunction(spv::OpBranch, merge_label);
 
 	EmitLabel(state, available_label);

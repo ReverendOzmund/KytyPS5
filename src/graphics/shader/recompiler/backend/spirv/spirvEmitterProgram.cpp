@@ -290,7 +290,8 @@ void EmitDispatcherInstruction(ValueEmitContext& ctx, const DispatcherFunctionSt
 }
 
 template <typename EmitInstruction>
-void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction) {
+void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& emit_instruction,
+               const std::function<void()>& after_phis = {}) {
 	ctx.state.current_block = block;
 	EmitLabel(ctx.state, block->Definition());
 	bool emitted_non_phi = false;
@@ -300,6 +301,9 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 				ctx.Fail(inst, "appears after a non-Phi instruction");
 			}
 		} else {
+			if (!emitted_non_phi && after_phis) {
+				after_phis();
+			}
 			emitted_non_phi = true;
 		}
 		for (uint32_t half = 0; half < ctx.state.lane_count; half++) {
@@ -314,6 +318,36 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 		}
 		ctx.state.lane_half = 0;
 	}
+	if (!emitted_non_phi && after_phis) {
+		after_phis();
+	}
+}
+
+// A BDA read of an unmapped page returns zero and records a fault, which is serviced only after
+// the dispatch. A loop that waits on such memory (GTA V's BVH traversal walks a primitive list
+// until it reads an end marker) would then spin until the driver resets the device. An invocation
+// that has faulted and keeps looping returns instead; the page is mapped for the next dispatch.
+constexpr uint32_t FaultedLoopIterationLimit = 4096;
+
+void EmitFaultedLoopWatchdog(EmitterState& state) {
+	const auto u     = TypeU32(state);
+	const auto count = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, u, count, state.loop_iteration_variable);
+	const auto next = EmitAddU32(state, count, ConstantU32(state, 1));
+	state.builder.AddFunction(spv::OpStore, state.loop_iteration_variable, next);
+	const auto fault = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpLoad, u, fault, state.bda_fault_variable);
+	const auto stop = Binary(state, spv::OpLogicalAnd, TypeBool(state),
+	                         Binary(state, spv::OpINotEqual, TypeBool(state), fault, ConstantU32(state, 0)),
+	                         Binary(state, spv::OpUGreaterThan, TypeBool(state), next,
+	                                ConstantU32(state, FaultedLoopIterationLimit)));
+	const auto return_label   = state.builder.AllocateId();
+	const auto continue_label = state.builder.AllocateId();
+	state.builder.AddFunction(spv::OpSelectionMerge, continue_label, spv::SelectionControlMaskNone);
+	state.builder.AddFunction(spv::OpBranchConditional, stop, return_label, continue_label);
+	EmitLabel(state, return_label);
+	state.builder.AddFunction(spv::OpReturn);
+	EmitLabel(state, continue_label);
 }
 
 void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structured) {
@@ -334,12 +368,30 @@ void PatchStructuredPhis(ValueEmitContext& ctx, StructuredFunctionState& structu
 void EmitStructuredFunction(ValueEmitContext& ctx) {
 	const auto& program = ctx.state.program;
 	StructuredFunctionState structured;
+	// The first block of each loop body, entered once per iteration.
+	std::unordered_set<const IR::Block*> loop_bodies;
+	if (ctx.state.bda_fault_variable != 0) {
+		for (const auto* block: program.blocks) {
+			const auto& term = block->terminator;
+			if (!term.loop_header) continue;
+			const auto* body = term.kind == CFG::TerminatorKind::ConditionalBranch &&
+			                           term.true_block == term.merge_block
+			                       ? term.false_block
+			                       : term.true_block;
+			// Splitting a block that is itself a loop header or continue target would move its
+			// OpLoopMerge or back edge out of the block the structured rules require.
+			if (body != nullptr && body != term.merge_block && body != term.continue_block &&
+			    !body->terminator.loop_header)
+				loop_bodies.insert(body);
+		}
+	}
+	const std::function<void()> watchdog = [&] { EmitFaultedLoopWatchdog(ctx.state); };
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
 	for (size_t index = 0; index < program.blocks.size(); index++) {
 		const auto* block = program.blocks[index];
 		EmitBlock(ctx, block, [&](ValueEmitContext& lane, const IR::Inst& inst) {
 			EmitStructuredInstruction(lane, structured, inst);
-		});
+		}, loop_bodies.contains(block) ? watchdog : std::function<void()> {});
 		structured.block_exit_labels.emplace(block, ctx.state.current_label);
 		EmitStructuredTerminator(ctx, block);
 	}
@@ -737,6 +789,10 @@ void EmitProgram(EmitterState& state) {
 	if (state.pixel_valid_mask_variable != 0) {
 		state.builder.AddFunction(spv::OpStore, state.pixel_valid_mask_variable,
 		                          ConstantU32(state, 1));
+	}
+	if (state.bda_fault_variable != 0) {
+		state.builder.AddFunction(spv::OpStore, state.bda_fault_variable, ConstantU32(state, 0));
+		state.builder.AddFunction(spv::OpStore, state.loop_iteration_variable, ConstantU32(state, 0));
 	}
 	if (state.lds_storage_class == spv::StorageClassStorageBuffer && state.lds_variable != 0) {
 		const auto group_x = EmitInputComponentU32(state, IR::StageInputKind::WorkgroupId, 0);
