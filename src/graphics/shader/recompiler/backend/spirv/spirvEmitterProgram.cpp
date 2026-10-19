@@ -3,6 +3,8 @@
 #include "common/assert.h"
 
 #include <algorithm>
+#include <cstdio>
+#include <cstdlib>
 #include <bit>
 #include <functional>
 #include <optional>
@@ -329,6 +331,19 @@ void EmitBlock(ValueEmitContext& ctx, const IR::Block* block, EmitInstruction&& 
 // that has faulted and keeps looping returns instead; the page is mapped for the next dispatch.
 constexpr uint32_t FaultedLoopIterationLimit = 4096;
 
+} // namespace
+
+// Debug: KYTY_LOOP_WATCHDOG=N stops every invocation after N loop iterations, faulted or not.
+uint32_t LoopWatchdogLimit() {
+	static const uint32_t limit = [] {
+		const char* value = std::getenv("KYTY_LOOP_WATCHDOG");
+		return value != nullptr ? static_cast<uint32_t>(std::strtoul(value, nullptr, 10)) : 0u;
+	}();
+	return limit;
+}
+
+namespace {
+
 void EmitFaultedLoopWatchdog(EmitterState& state) {
 	const auto u     = TypeU32(state);
 	const auto count = state.builder.AllocateId();
@@ -337,10 +352,13 @@ void EmitFaultedLoopWatchdog(EmitterState& state) {
 	state.builder.AddFunction(spv::OpStore, state.loop_iteration_variable, next);
 	const auto fault = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpLoad, u, fault, state.bda_fault_variable);
-	const auto stop = Binary(state, spv::OpLogicalAnd, TypeBool(state),
-	                         Binary(state, spv::OpINotEqual, TypeBool(state), fault, ConstantU32(state, 0)),
-	                         Binary(state, spv::OpUGreaterThan, TypeBool(state), next,
-	                                ConstantU32(state, FaultedLoopIterationLimit)));
+	const auto limit = LoopWatchdogLimit();
+	const auto stop = limit != 0
+	    ? Binary(state, spv::OpUGreaterThan, TypeBool(state), next, ConstantU32(state, limit))
+	    : Binary(state, spv::OpLogicalAnd, TypeBool(state),
+	             Binary(state, spv::OpINotEqual, TypeBool(state), fault, ConstantU32(state, 0)),
+	             Binary(state, spv::OpUGreaterThan, TypeBool(state), next,
+	                    ConstantU32(state, FaultedLoopIterationLimit)));
 	const auto return_label   = state.builder.AllocateId();
 	const auto continue_label = state.builder.AllocateId();
 	state.builder.AddFunction(spv::OpSelectionMerge, continue_label, spv::SelectionControlMaskNone);
@@ -384,6 +402,11 @@ void EmitStructuredFunction(ValueEmitContext& ctx) {
 			    !body->terminator.loop_header)
 				loop_bodies.insert(body);
 		}
+	}
+	if (!loop_bodies.empty() && LoopWatchdogLimit() != 0) {
+		std::fprintf(stderr, "LOOP-WATCHDOG hash=0x%016llx loops=%zu limit=%u\n",
+		             static_cast<unsigned long long>(program.shader_hash), loop_bodies.size(),
+		             LoopWatchdogLimit());
 	}
 	const std::function<void()> watchdog = [&] { EmitFaultedLoopWatchdog(ctx.state); };
 	ctx.state.builder.AddFunction(spv::OpBranch, program.blocks.front()->Definition());
@@ -728,6 +751,7 @@ void EmitProgram(EmitterState& state) {
 			high.dispatcher_spills = &dispatch.spills[1];
 		}
 	}
+	if (LoopWatchdogLimit() != 0) DefineLoopWatchdogVariables(state);
 	DefineGetBdaPointer(state);
 	DefineIndirectBufferLoads(ctx);
 	DefineIndirectBufferFormats(ctx);

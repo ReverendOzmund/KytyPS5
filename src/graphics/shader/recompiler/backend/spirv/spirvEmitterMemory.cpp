@@ -1358,18 +1358,23 @@ void DefineIndirectBufferFormats(ValueEmitContext& ctx) {
 	state.builder.AddFunction(spv::OpFunctionEnd);
 }
 
-void DefineGetBdaPointer(EmitterState& state) {
-	if (!state.program.info.uses_dma) {
-		return;
-	}
-	// Per-invocation: whether a BDA read found its page unmapped (it reads zero until the fault is
-	// serviced after the dispatch), and how many loop iterations the invocation has run.
+// Per-invocation: whether a BDA read found its page unmapped (it reads zero until the fault is
+// serviced after the dispatch), and how many loop iterations the invocation has run.
+void DefineLoopWatchdogVariables(EmitterState& state) {
+	if (state.loop_iteration_variable != 0) return;
 	const auto private_u32 = TypePointer(state, spv::StorageClassPrivate, TypeU32(state));
 	state.bda_fault_variable = state.builder.DefineGlobalVariable(private_u32, spv::StorageClassPrivate);
 	state.loop_iteration_variable =
 	    state.builder.DefineGlobalVariable(private_u32, spv::StorageClassPrivate);
 	state.builder.AddName(state.bda_fault_variable, "bda_faulted");
 	state.builder.AddName(state.loop_iteration_variable, "loop_iterations");
+}
+
+void DefineGetBdaPointer(EmitterState& state) {
+	if (!state.program.info.uses_dma) {
+		return;
+	}
+	DefineLoopWatchdogVariables(state);
 	const auto type            = TypeU64(state);
 	const auto function_type   = state.builder.Type(spv::OpTypeFunction, type, type);
 	state.bda_pointer_function = state.builder.AllocateId();
